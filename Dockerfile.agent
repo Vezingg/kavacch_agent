@@ -1,0 +1,48 @@
+# Unified Dockerfile for Box Retail Agent (FastWorkflow + CloudApp)
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 1. Install system dependencies
+#    - gcc: required for native Python extensions
+#    - curl: used in start.sh to health-check FastWorkflow before starting CloudApp
+RUN apt-get update && apt-get install -y gcc curl && rm -rf /var/lib/apt/lists/*
+
+# 2. Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 3. Copy application code
+COPY box_retail_agent/ ./box_retail_agent/
+
+# 4. Copy startup script
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
+# 5. Setup data directory for FastWorkflow speed dicts
+RUN mkdir -p /app/data
+
+# 6. Pre-train the FastWorkflow application
+RUN python -m fastworkflow.train \
+    /app/box_retail_agent \
+    /app/box_retail_agent/fastworkflow.env \
+    /app/box_retail_agent/fastworkflow.passwords.env
+
+# 7. Set environment variables
+ENV SPEEDDICT_FOLDERNAME=/app/data
+ENV HOST=0.0.0.0
+# FastWorkflow FastAPI runs on port 8000 (internal)
+ENV PORT=8000
+# CloudApp runs on port 8080 (public-facing)
+ENV CLOUDAPP_PORT=8080
+ENV CLOUDAPP_HOST=0.0.0.0
+
+# 8. Expose ports
+#    - 8000: FastWorkflow FastAPI (internal)
+#    - 8080: CloudApp/WhatsApp webhook (public — Cloud Run routes here)
+EXPOSE 8000
+EXPOSE 8080
+
+# 9. Start both services via start.sh:
+#    FastWorkflow starts in background → curl polls until ready → CloudApp starts in foreground
+CMD ["/bin/bash", "/app/start.sh"]
