@@ -207,14 +207,5 @@ marimo/_lsp/
 __marimo__/
 
 action.jsonl
-cloudbuild-agent.yaml
-cloudbuild.yaml
-deploy-gcp.sh
-deploy.sh
-docker-compose.yml
-start.sh
-test_locally.sh
-update_token.sh
-.dockerignore
 box_retail_agent/fastworkflow.passwords.env
 box_retail_agent/appliation/last_30_logs.txt

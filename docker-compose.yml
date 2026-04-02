@@ -1,0 +1,52 @@
+# docker-compose.yml - For local testing only
+# Usage: docker-compose up --build
+#
+# Environment variables are read from:
+#   - box_retail_agent/fastworkflow.env
+#   - box_retail_agent/fastworkflow.passwords.env
+#
+# For WhatsApp credentials, set these in fastworkflow.passwords.env:
+#   WHATSAPP_PHONE_NUMBER_ID=xxx
+#   WHATSAPP_ACCESS_TOKEN=xxx
+#
+# For cloud_app webhook, set WHATSAPP_VERIFY_TOKEN env var or pass via command line
+
+version: '3.8'
+
+services:
+  # FastWorkflow Agent
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    ports:
+      - "8000:8000"
+    environment:
+      # Override CLOUD_APP_URL for docker networking
+      - CLOUD_APP_URL=http://cloudapp:8080
+    networks:
+      - kalash-network
+
+  # WhatsApp Cloud App (Webhook Handler)
+  cloudapp:
+    build:
+      context: .
+      dockerfile: Dockerfile.cloudapp
+    ports:
+      - "8080:8080"
+    env_file:
+      - box_retail_agent/fastworkflow.env
+      - box_retail_agent/fastworkflow.passwords.env
+    environment:
+      # Webhook verification token (set this or pass via CLI)
+      - WHATSAPP_VERIFY_TOKEN=${WHATSAPP_VERIFY_TOKEN:-kalash_verify_token_2024}
+      # Override FASTWORKFLOW_URL for docker networking
+      - FASTWORKFLOW_URL=http://agent:8000
+    depends_on:
+      - agent
+    networks:
+      - kalash-network
+
+networks:
+  kalash-network:
+    driver: bridge

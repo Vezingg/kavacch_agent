@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 from typing import Dict, Optional
 
 # --- LOAD ENV FILES ---
@@ -76,6 +77,12 @@ pending_orders: Dict[str, dict] = {}
 # When factory sends a message, we check if there's a pending order
 # Format: customer_phone (most recent pending order)
 current_pricing_request: Optional[str] = None
+
+# Conversation transcripts: phone → [{role, text, timestamp}]
+conversation_logs: Dict[str, list] = {}
+
+# Per-customer control state: phone → "BOT_CONTROL" | "HUMAN_CONTROL"
+control_state: Dict[str, str] = {}
 
 # ---------------------------------------------------------------------------
 # Welcome message
@@ -269,6 +276,38 @@ def cleanup_processed_messages(max_age_minutes: int = 30):
 
 
 # ---------------------------------------------------------------------------
+# Conversation State & Logging Helpers
+# ---------------------------------------------------------------------------
+
+def log_message(phone: str, role: str, text: str):
+    """Append a message to the in-memory conversation transcript."""
+    if phone not in conversation_logs:
+        conversation_logs[phone] = []
+    conversation_logs[phone].append({
+        "role": role,
+        "text": text,
+        "timestamp": datetime.now().isoformat()
+    })
+
+
+def get_control_state(phone: str) -> str:
+    """Return BOT_CONTROL or HUMAN_CONTROL for a customer. Default is BOT_CONTROL."""
+    return control_state.get(phone, "BOT_CONTROL")
+
+
+def set_control_state(phone: str, state: str):
+    """Set the control state for a customer conversation."""
+    control_state[phone] = state
+    logger.info(f"Control state for {phone} → {state}")
+
+
+async def send_and_log(phone: str, message: str) -> bool:
+    """Send a WhatsApp message to a customer and log it to the transcript."""
+    log_message(phone, "bot", message)
+    return await send_whatsapp(phone, message)
+
+
+# ---------------------------------------------------------------------------
 # Message Handling
 # ---------------------------------------------------------------------------
 
@@ -298,7 +337,8 @@ Reply 'confirm' to proceed with the order or ask any questions.
 Thank you for choosing Kalash Packaging! 🙏
 """
         
-        # Send to customer
+        # Log and send to customer
+        log_message(customer_phone, "bot", pricing_message)
         await send_whatsapp(customer_phone, pricing_message)
         logger.info(f"Forwarded pricing to customer {customer_phone}")
         
@@ -321,17 +361,17 @@ async def handle_customer_message(phone: str, text: str):
     
     # Check for greetings
     if stripped in {"hi", "hello", "hey", "hii"}:
-        await send_whatsapp(phone, WELCOME_MESSAGE)
+        await send_and_log(phone, WELCOME_MESSAGE)
         return
     
     # Check for help
     if stripped in {"help", "?", "menu"}:
-        await send_whatsapp(phone, HELP_MESSAGE)
+        await send_and_log(phone, HELP_MESSAGE)
         return
     
     # Check for order confirmation (after receiving pricing)
     if stripped == "confirm":
-        await send_whatsapp(
+        await send_and_log(
             phone,
             "✅ Thank you for confirming your order!\n\n"
             "Our team will contact you shortly to finalize the details.\n\n"
@@ -344,7 +384,7 @@ async def handle_customer_message(phone: str, text: str):
     response = await chat_with_agent(phone, text)
     
     if response:
-        await send_whatsapp(phone, response)
+        await send_and_log(phone, response)
 
 
 async def handle_message(phone: str, text: str):
@@ -359,6 +399,14 @@ async def handle_message(phone: str, text: str):
             await handle_factory_reply(text)
         else:
             logger.info(f"[CUSTOMER {phone}] Message: {text}")
+            # Log incoming message to transcript
+            log_message(phone, "user", text)
+
+            # If factory has taken over via dashboard, skip the agent
+            if get_control_state(phone) == "HUMAN_CONTROL":
+                logger.info(f"[HUMAN_CONTROL] Skipping agent for {phone} — factory handles via dashboard")
+                return
+
             await handle_customer_message(phone, text)
             
     except Exception as e:
@@ -467,6 +515,83 @@ async def api_get_pending_orders():
         },
         "current_pricing_request": current_pricing_request
     }
+
+
+# ---------------------------------------------------------------------------
+# Factory Dashboard
+# ---------------------------------------------------------------------------
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    """Serve the factory operator dashboard."""
+    dashboard_path = Path(__file__).parent / "dashboard.html"
+    with open(dashboard_path) as f:
+        return HTMLResponse(content=f.read())
+
+
+@app.get("/api/conversations")
+async def api_get_conversations():
+    """List all conversations with metadata."""
+    result = {}
+    for phone, messages in conversation_logs.items():
+        last_msg = messages[-1] if messages else None
+        result[phone] = {
+            "state": get_control_state(phone),
+            "message_count": len(messages),
+            "last_message": last_msg
+        }
+    return result
+
+
+@app.get("/api/conversations/{phone}")
+async def api_get_conversation(phone: str):
+    """Get full transcript for a customer."""
+    return {
+        "phone": phone,
+        "state": get_control_state(phone),
+        "messages": conversation_logs.get(phone, [])
+    }
+
+
+@app.post("/api/toggle/{phone}")
+async def api_toggle_control(phone: str):
+    """Toggle BOT_CONTROL ⇔ HUMAN_CONTROL for a conversation."""
+    current = get_control_state(phone)
+    new_state = "HUMAN_CONTROL" if current == "BOT_CONTROL" else "BOT_CONTROL"
+    set_control_state(phone, new_state)
+
+    if new_state == "HUMAN_CONTROL":
+        msg = "Please wait, connecting you to our team... 👤"
+    else:
+        msg = "Our automated assistant is back. How can I help? 🤖"
+
+    log_message(phone, "bot", msg)
+    await send_whatsapp(phone, msg)
+    return {"phone": phone, "state": new_state}
+
+
+@app.post("/api/agent/send")
+async def api_agent_send(request: Request):
+    """Factory sends a message to a customer from the dashboard."""
+    data = await request.json()
+    phone = data.get("phone")
+    message = data.get("message", "").strip()
+
+    if not phone or not message:
+        return JSONResponse({"error": "Missing phone or message"}, status_code=400)
+
+    if get_control_state(phone) != "HUMAN_CONTROL":
+        return JSONResponse(
+            {"error": "Conversation is not in HUMAN_CONTROL. Toggle takeover first."},
+            status_code=400
+        )
+
+    log_message(phone, "bot", message)
+    success = await send_whatsapp(phone, message)
+
+    if success:
+        return {"status": "sent"}
+    return JSONResponse({"error": "Failed to send message"}, status_code=500)
 
 
 # ---------------------------------------------------------------------------

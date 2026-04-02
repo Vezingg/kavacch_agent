@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kalash Packaging — Factory Dashboard</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f0f2f5;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* ── Top bar ── */
+        .topbar {
+            background: #1a1a2e;
+            color: white;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+
+        .topbar-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #25d366;
+        }
+
+        .topbar-title {
+            font-size: 15px;
+            font-weight: 600;
+        }
+
+        .topbar-sub {
+            font-size: 12px;
+            color: #888;
+            margin-left: auto;
+        }
+
+        /* ── Layout ── */
+        .app {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* ── Sidebar ── */
+        .sidebar {
+            width: 300px;
+            background: white;
+            border-right: 1px solid #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .sidebar-header {
+            padding: 14px 16px;
+            border-bottom: 1px solid #e0e0e0;
+            font-size: 12px;
+            font-weight: 700;
+            color: #777;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .conv-count {
+            background: #4361ee;
+            color: white;
+            border-radius: 10px;
+            padding: 1px 7px;
+            font-size: 11px;
+        }
+
+        .conv-list {
+            overflow-y: auto;
+            flex: 1;
+        }
+
+        .conv-item {
+            padding: 13px 16px;
+            border-bottom: 1px solid #f5f5f5;
+            cursor: pointer;
+            transition: background 0.12s;
+        }
+
+        .conv-item:hover {
+            background: #f7f8fc;
+        }
+
+        .conv-item.active {
+            background: #eff3ff;
+            border-left: 3px solid #4361ee;
+            padding-left: 13px;
+        }
+
+        .conv-item-row1 {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 4px;
+        }
+
+        .conv-phone {
+            font-weight: 600;
+            font-size: 13px;
+            color: #1a1a2e;
+        }
+
+        .conv-time {
+            font-size: 11px;
+            color: #bbb;
+        }
+
+        .conv-preview {
+            font-size: 12px;
+            color: #999;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 200px;
+        }
+
+        .state-pill {
+            display: inline-block;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 2px 7px;
+            border-radius: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            margin-top: 4px;
+        }
+
+        .pill-bot {
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+
+        .pill-human {
+            background: #fff3e0;
+            color: #e65100;
+        }
+
+        .no-convs {
+            padding: 48px 20px;
+            text-align: center;
+            color: #bbb;
+            font-size: 13px;
+            line-height: 1.8;
+        }
+
+        /* ── Chat panel ── */
+        .chat-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            background: #f0f2f5;
+        }
+
+        /* Placeholder */
+        .placeholder {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: #ccc;
+            gap: 12px;
+        }
+
+        .placeholder-icon {
+            font-size: 56px;
+        }
+
+        .placeholder-text {
+            font-size: 14px;
+        }
+
+        /* Chat header */
+        .chat-header {
+            background: white;
+            border-bottom: 1px solid #e0e0e0;
+            padding: 14px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-shrink: 0;
+        }
+
+        .chat-header-left {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .chat-header-phone {
+            font-weight: 700;
+            font-size: 16px;
+            color: #1a1a2e;
+        }
+
+        .chat-header-status {
+            font-size: 12px;
+            color: #888;
+        }
+
+        /* Toggle */
+        .toggle-wrap {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .toggle-label {
+            font-size: 13px;
+            font-weight: 600;
+            color: #555;
+        }
+
+        .toggle-btn {
+            position: relative;
+            width: 48px;
+            height: 26px;
+            background: #ccc;
+            border-radius: 13px;
+            cursor: pointer;
+            transition: background 0.25s;
+            border: none;
+            outline: none;
+        }
+
+        .toggle-btn.on {
+            background: #ff7043;
+        }
+
+        .toggle-btn::after {
+            content: '';
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            background: white;
+            border-radius: 50%;
+            top: 3px;
+            left: 3px;
+            transition: left 0.25s;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+        }
+
+        .toggle-btn.on::after {
+            left: 25px;
+        }
+
+        /* Messages area */
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .msg-wrapper {
+            display: flex;
+            flex-direction: column;
+            max-width: 65%;
+        }
+
+        .msg-wrapper.user {
+            align-self: flex-start;
+            align-items: flex-start;
+        }
+
+        .msg-wrapper.bot {
+            align-self: flex-end;
+            align-items: flex-end;
+        }
+
+        .msg-label {
+            font-size: 10px;
+            color: #aaa;
+            margin-bottom: 3px;
+        }
+
+        .msg-bubble {
+            padding: 9px 13px;
+            border-radius: 12px;
+            font-size: 13.5px;
+            line-height: 1.55;
+            word-break: break-word;
+        }
+
+        .msg-bubble.user {
+            background: white;
+            border: 1px solid #e0e0e0;
+            color: #1a1a2e;
+            border-bottom-left-radius: 4px;
+        }
+
+        .msg-bubble.bot {
+            background: #dcf8c6;
+            color: #1a1a2e;
+            border-bottom-right-radius: 4px;
+        }
+
+        .msg-time {
+            font-size: 10px;
+            color: #bbb;
+            margin-top: 3px;
+        }
+
+        /* Input area */
+        .input-area {
+            padding: 14px 16px;
+            background: white;
+            border-top: 1px solid #e0e0e0;
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+            flex-shrink: 0;
+        }
+
+        .input-area textarea {
+            flex: 1;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-size: 14px;
+            font-family: inherit;
+            resize: none;
+            outline: none;
+            min-height: 44px;
+            max-height: 120px;
+            transition: border-color 0.2s;
+        }
+
+        .input-area textarea:focus {
+            border-color: #4361ee;
+        }
+
+        .send-btn {
+            height: 44px;
+            padding: 0 20px;
+            background: #4361ee;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+
+        .send-btn:hover:not(:disabled) {
+            background: #3251d3;
+        }
+
+        .send-btn:disabled {
+            background: #aaa;
+            cursor: not-allowed;
+        }
+
+        .input-locked {
+            padding: 14px 16px;
+            background: #fafafa;
+            border-top: 1px solid #e0e0e0;
+            text-align: center;
+            font-size: 13px;
+            color: #aaa;
+            flex-shrink: 0;
+        }
+
+        /* Toast notification */
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: #1a1a2e;
+            color: white;
+            padding: 11px 20px;
+            border-radius: 8px;
+            font-size: 13px;
+            opacity: 0;
+            transform: translateY(8px);
+            transition: opacity 0.3s, transform 0.3s;
+            pointer-events: none;
+            z-index: 999;
+            max-width: 320px;
+        }
+
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .toast.error {
+            background: #c62828;
+        }
+
+        /* ── Password gate ── */
+        #pw-gate {
+            position: fixed;
+            inset: 0;
+            background: #1a1a2e;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+        }
+
+        .pw-box {
+            background: white;
+            border-radius: 14px;
+            padding: 40px 36px;
+            width: 320px;
+            text-align: center;
+            box-shadow: 0 8px 40px rgba(0, 0, 0, 0.35);
+        }
+
+        .pw-logo {
+            font-size: 36px;
+            margin-bottom: 12px;
+        }
+
+        .pw-title {
+            font-size: 17px;
+            font-weight: 700;
+            color: #1a1a2e;
+            margin-bottom: 4px;
+        }
+
+        .pw-sub {
+            font-size: 12px;
+            color: #999;
+            margin-bottom: 24px;
+        }
+
+        .pw-input {
+            width: 100%;
+            padding: 11px 14px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 15px;
+            outline: none;
+            letter-spacing: 2px;
+            text-align: center;
+            margin-bottom: 14px;
+            transition: border-color 0.2s;
+        }
+
+        .pw-input:focus {
+            border-color: #4361ee;
+        }
+
+        .pw-input.shake {
+            animation: shake 0.35s;
+            border-color: #c62828;
+        }
+
+        @keyframes shake {
+
+            0%,
+            100% {
+                transform: translateX(0);
+            }
+
+            25% {
+                transform: translateX(-6px);
+            }
+
+            75% {
+                transform: translateX(6px);
+            }
+        }
+
+        .pw-btn {
+            width: 100%;
+            padding: 11px;
+            background: #4361ee;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .pw-btn:hover {
+            background: #3251d3;
+        }
+
+        .pw-error {
+            color: #c62828;
+            font-size: 12px;
+            margin-top: 10px;
+            min-height: 16px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- Password gate — hidden after correct password -->
+    <div id="pw-gate">
+        <div class="pw-box">
+            <div class="pw-logo">📦</div>
+            <div class="pw-title">Kalash Packaging</div>
+            <div class="pw-sub">Factory Dashboard — Authorised Access Only</div>
+            <input id="pw-input" class="pw-input" type="password" placeholder="Enter password"
+                onkeydown="if(event.key==='Enter') checkPassword()" />
+            <button class="pw-btn" onclick="checkPassword()">Unlock Dashboard</button>
+            <div class="pw-error" id="pw-error"></div>
+        </div>
+    </div>
+
+    <div class="topbar">
+        <div class="topbar-dot"></div>
+        <span class="topbar-title">Kalash Packaging — Factory Dashboard</span>
+        <span class="topbar-sub" id="last-refresh">Waiting...</span>
+    </div>
+
+    <div class="app">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                Conversations
+                <span class="conv-count" id="conv-count">0</span>
+            </div>
+            <div class="conv-list" id="conv-list">
+                <div class="no-convs">No conversations yet.<br>Waiting for WhatsApp messages...</div>
+            </div>
+        </div>
+
+        <!-- Chat panel -->
+        <div class="chat-panel" id="chat-panel">
+            <div class="placeholder">
+                <div class="placeholder-icon">💬</div>
+                <div class="placeholder-text">Select a conversation from the left</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        let selectedPhone = null;
+        let conversations = {};
+        let lastMsgCount = {};
+
+        // ── Utilities ──────────────────────────────────────────────────────────
+
+        function fmtTime(iso) {
+            if (!iso) return '';
+            const d = new Date(iso);
+            return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+
+        function fmtPhone(phone) {
+            if (!phone) return '';
+            if (phone.length === 12 && phone.startsWith('91')) {
+                return '+91 ' + phone.slice(2, 7) + ' ' + phone.slice(7);
+            }
+            return '+' + phone;
+        }
+
+        function escHtml(str) {
+            const d = document.createElement('div');
+            d.textContent = str;
+            return d.innerHTML.replace(/\n/g, '<br>');
+        }
+
+        function toast(msg, isError = false) {
+            const el = document.getElementById('toast');
+            el.textContent = msg;
+            el.className = 'toast show' + (isError ? ' error' : '');
+            clearTimeout(el._t);
+            el._t = setTimeout(() => el.className = 'toast', 3000);
+        }
+
+        // ── Sidebar ────────────────────────────────────────────────────────────
+
+        function renderSidebar(convs) {
+            const list = document.getElementById('conv-list');
+            const count = document.getElementById('conv-count');
+            const phones = Object.keys(convs);
+            count.textContent = phones.length;
+
+            if (phones.length === 0) {
+                list.innerHTML = '<div class="no-convs">No conversations yet.<br>Waiting for WhatsApp messages...</div>';
+                return;
+            }
+
+            phones.sort((a, b) => {
+                const at = convs[a].last_message?.timestamp || '';
+                const bt = convs[b].last_message?.timestamp || '';
+                return bt.localeCompare(at);
+            });
+
+            list.innerHTML = phones.map(phone => {
+                const c = convs[phone];
+                const isActive = phone === selectedPhone;
+                const isHuman = c.state === 'HUMAN_CONTROL';
+                const preview = c.last_message ? c.last_message.text.replace(/\n/g, ' ').slice(0, 45) : 'No messages';
+                const time = c.last_message ? fmtTime(c.last_message.timestamp) : '';
+                const hasNew = (lastMsgCount[phone] !== undefined)
+                    && c.message_count > lastMsgCount[phone]
+                    && phone !== selectedPhone;
+
+                return `
+                <div class="conv-item${isActive ? ' active' : ''}" onclick="selectConv('${phone}')">
+                    <div class="conv-item-row1">
+                        <span class="conv-phone">${fmtPhone(phone)}${hasNew ? ' 🔵' : ''}</span>
+                        <span class="conv-time">${time}</span>
+                    </div>
+                    <div class="conv-preview">${escHtml(preview)}</div>
+                    <span class="state-pill ${isHuman ? 'pill-human' : 'pill-bot'}">
+                        ${isHuman ? '🔴 Human' : '🟢 Bot'}
+                    </span>
+                </div>`;
+            }).join('');
+        }
+
+        // ── Chat panel ─────────────────────────────────────────────────────────
+
+        function renderChat(phone, data) {
+            const panel = document.getElementById('chat-panel');
+            const isHuman = data.state === 'HUMAN_CONTROL';
+
+            const msgs = data.messages.map(m => `
+            <div class="msg-wrapper ${m.role}">
+                <div class="msg-label">${m.role === 'user' ? '👤 Customer' : '🤖 Bot / Factory'}</div>
+                <div class="msg-bubble ${m.role}">${escHtml(m.text)}</div>
+                <div class="msg-time">${fmtTime(m.timestamp)}</div>
+            </div>`).join('');
+
+            const inputArea = isHuman
+                ? `<div class="input-area">
+                <textarea id="msg-input"
+                    placeholder="Type a reply as Kalash Packaging…"
+                    rows="1"
+                    onkeydown="handleKey(event,'${phone}')"></textarea>
+                <button class="send-btn" id="send-btn" onclick="sendMsg('${phone}')">Send</button>
+               </div>`
+                : `<div class="input-locked">
+                Toggle "Take Over" to send messages manually
+               </div>`;
+
+            panel.innerHTML = `
+            <div class="chat-header">
+                <div class="chat-header-left">
+                    <span class="chat-header-phone">${fmtPhone(phone)}</span>
+                    <span class="chat-header-status">
+                        ${isHuman
+                    ? '🔴 Factory in control — agent is paused'
+                    : '🟢 Agent active — toggle to take over'}
+                    </span>
+                </div>
+                <div class="toggle-wrap">
+                    <span class="toggle-label">${isHuman ? 'Disable Takeover' : 'Take Over'}</span>
+                    <button class="toggle-btn${isHuman ? ' on' : ''}"
+                            onclick="toggleControl('${phone}')"
+                            title="${isHuman ? 'Return control to bot' : 'Take over this conversation'}">
+                    </button>
+                </div>
+            </div>
+            <div class="messages" id="msg-panel">
+                ${msgs || '<div style="text-align:center;color:#ccc;padding:40px">No messages yet</div>'}
+            </div>
+            ${inputArea}`;
+
+            // Scroll to bottom
+            const mp = document.getElementById('msg-panel');
+            if (mp) mp.scrollTop = mp.scrollHeight;
+        }
+
+        // ── Actions ────────────────────────────────────────────────────────────
+
+        async function selectConv(phone) {
+            selectedPhone = phone;
+            try {
+                const resp = await fetch(`/api/conversations/${phone}`);
+                const data = await resp.json();
+                renderChat(phone, data);
+                lastMsgCount[phone] = data.messages.length;
+                renderSidebar(conversations);  // update active state in sidebar
+            } catch (e) {
+                toast('Failed to load conversation', true);
+            }
+        }
+
+        async function toggleControl(phone) {
+            try {
+                const resp = await fetch(`/api/toggle/${phone}`, { method: 'POST' });
+                const data = await resp.json();
+                const msg = data.state === 'HUMAN_CONTROL'
+                    ? '🔴 Takeover enabled — agent paused'
+                    : '🟢 Agent resumed';
+                toast(msg);
+                await selectConv(phone);
+                await pollConvs();
+            } catch (e) {
+                toast('Toggle failed', true);
+            }
+        }
+
+        async function sendMsg(phone) {
+            const input = document.getElementById('msg-input');
+            const btn = document.getElementById('send-btn');
+            const text = input?.value.trim();
+            if (!text) return;
+
+            btn.disabled = true;
+            input.value = '';
+
+            try {
+                const resp = await fetch('/api/agent/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phone, message: text })
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    toast('Error: ' + (data.error || 'Send failed'), true);
+                    input.value = text;  // restore on failure
+                } else {
+                    await selectConv(phone);
+                }
+            } catch (e) {
+                toast('Network error', true);
+                input.value = text;
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        function handleKey(event, phone) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMsg(phone);
+            }
+        }
+
+        // ── Polling ────────────────────────────────────────────────────────────
+
+        async function pollConvs() {
+            try {
+                const resp = await fetch('/api/conversations');
+                const data = await resp.json();
+                conversations = data;
+                renderSidebar(data);
+
+                document.getElementById('last-refresh').textContent =
+                    'Updated ' + new Date().toLocaleTimeString();
+
+                // If active conversation has new messages, refresh silently
+                if (selectedPhone && data[selectedPhone]) {
+                    const newCount = data[selectedPhone].message_count;
+                    const oldCount = lastMsgCount[selectedPhone] ?? newCount;
+                    if (newCount > oldCount) {
+                        await selectConv(selectedPhone);
+                    }
+                }
+
+                // Seed counts for unread tracking (but don't overwrite known ones)
+                for (const phone in data) {
+                    if (phone !== selectedPhone && lastMsgCount[phone] === undefined) {
+                        lastMsgCount[phone] = data[phone].message_count;
+                    }
+                }
+            } catch (_) {
+                document.getElementById('last-refresh').textContent = 'Connection lost…';
+            }
+        }
+
+        // ── Bootstrap ──────────────────────────────────────────────────────────
+        function checkPassword() {
+            const input = document.getElementById('pw-input');
+            const error = document.getElementById('pw-error');
+            if (input.value === 'kalash') {
+                document.getElementById('pw-gate').style.display = 'none';
+                pollConvs();
+                setInterval(pollConvs, 3000);
+            } else {
+                input.classList.remove('shake');
+                void input.offsetWidth;  // force reflow to restart animation
+                input.classList.add('shake');
+                input.value = '';
+                error.textContent = 'Incorrect password. Try again.';
+                setTimeout(() => input.classList.remove('shake'), 400);
+            }
+        }
+
+        // Focus the password input on load
+        window.addEventListener('load', () => document.getElementById('pw-input').focus());
+    </script>
+</body>
+
+</html>
