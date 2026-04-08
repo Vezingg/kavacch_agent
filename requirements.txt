@@ -8,3 +8,4 @@ fastapi_mcp
 Babel
 litellm
 pymupdf>=1.24.0
+google-cloud-firestore>=2.11.0

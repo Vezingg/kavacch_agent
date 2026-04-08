@@ -207,5 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 action.jsonl
+box_retail_agent/appliation/last_100_logs.txt
 box_retail_agent/fastworkflow.passwords.env
 box_retail_agent/appliation/last_30_logs.txt
+Kavacch_agent_cloud_commands.txt
+WhatsApp Typing Indicator Implementation Research.pdf

@@ -1,0 +1,25 @@
+steps:
+  # Build the updater container
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'asia-south1-docker.pkg.dev/kavacch-agent-lite-491904/kalash-repo/kalash-updater:latest'
+      - '-f'
+      - 'Dockerfile.updater'
+      - '.'
+    timeout: 600s
+
+  # Push the updater image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'asia-south1-docker.pkg.dev/kavacch-agent-lite-491904/kalash-repo/kalash-updater:latest'
+    timeout: 300s
+
+images:
+  - 'asia-south1-docker.pkg.dev/kavacch-agent-lite-491904/kalash-repo/kalash-updater:latest'
+
+timeout: 1200s
+options:
+  machineType: 'E2_HIGHCPU_8'

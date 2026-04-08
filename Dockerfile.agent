@@ -36,12 +36,19 @@ ENV PORT=8000
 # CloudApp runs on port 8080 (public-facing)
 ENV CLOUDAPP_PORT=8080
 ENV CLOUDAPP_HOST=0.0.0.0
+# Translation API runs on port 8081
+ENV TRANSLATION_API_PORT=8081
+ENV TRANSLATION_API_HOST=0.0.0.0
+# Translation API communicates with FastWorkflow FastAPI via localhost
+ENV FASTWORKFLOW_API_URL=http://localhost:8000
 
 # 8. Expose ports
 #    - 8000: FastWorkflow FastAPI (internal)
 #    - 8080: CloudApp/WhatsApp webhook (public — Cloud Run routes here)
+#    - 8081: Translation API
 EXPOSE 8000
 EXPOSE 8080
+EXPOSE 8081
 
 # 9. Start both services via start.sh:
 #    FastWorkflow starts in background → curl polls until ready → CloudApp starts in foreground

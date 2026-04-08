@@ -27,7 +27,6 @@ gcloud run deploy kalash-agent \
     --memory 2Gi \
     --cpu 1 \
     --port 8080 \
-    --set-env-vars "FACTORY_WHATSAPP=919725201616" \
     --update-secrets="SECRET_KEY=jwt_secret_key:latest,JWT_SECRET_KEY=jwt_secret_key:latest,WHATSAPP_VERIFY_TOKEN=whatsapp_verify_token:latest,WHATSAPP_PHONE_NUMBER_ID=whatsapp_phone_number_id:latest,WHATSAPP_ACCESS_TOKEN=whatsapp_access_token:latest"
 
 echo ""
