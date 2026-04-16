@@ -1,20 +1,17 @@
 #!/bin/bash
-# deploy-gcp.sh - Deploy both services to Google Cloud Run
+# deploy-gcp.sh - Build and deploy the unified Kalash Agent to Google Cloud Run
 # Usage: ./deploy-gcp.sh
 #
 # Reads configuration from:
-#   - box_retail_agent/fastworkflow.env
-#   - box_retail_agent/fastworkflow.passwords.env
+#   - box_support_agent/fastworkflow.env
+#   - box_support_agent/fastworkflow.passwords.env
 
 set -e
 
-# Configuration - CHANGE THESE
+# Configuration
 PROJECT_ID="kavacch-agent-lite-491904"
-REGION="asia-south1"  # Mumbai, change if needed
-
-# Service names
-AGENT_SERVICE="kalash-agent"
-CLOUDAPP_SERVICE="kalash-cloudapp"
+REGION="asia-south1"
+SERVICE="kalash-agent"
 
 # Colors for output
 RED='\033[0;31m'
@@ -43,10 +40,8 @@ load_env() {
     local file=$1
     if [[ -f "$file" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
-            # Skip comments and empty lines
             [[ "$line" =~ ^#.*$ ]] && continue
             [[ -z "$line" ]] && continue
-            # Export if contains =
             if [[ "$line" == *"="* ]]; then
                 export "$line"
             fi
@@ -55,8 +50,8 @@ load_env() {
 }
 
 echo -e "${YELLOW}Loading environment from fastworkflow env files...${NC}"
-load_env "box_retail_agent/fastworkflow.env"
-load_env "box_retail_agent/fastworkflow.passwords.env"
+load_env "box_support_agent/fastworkflow.env"
+load_env "box_support_agent/fastworkflow.passwords.env"
 
 # Verify required variables
 if [[ -z "$WHATSAPP_PHONE_NUMBER_ID" || "$WHATSAPP_PHONE_NUMBER_ID" == "your-phone-number-id" ]]; then
@@ -69,7 +64,6 @@ if [[ -z "$WHATSAPP_ACCESS_TOKEN" || "$WHATSAPP_ACCESS_TOKEN" == "your-access-to
     exit 1
 fi
 
-# Set verify token if not set
 WHATSAPP_VERIFY_TOKEN="${WHATSAPP_VERIFY_TOKEN:-kalash_verify_2024}"
 
 echo -e "${GREEN}Environment loaded:${NC}"
@@ -99,70 +93,47 @@ gcloud artifacts repositories create kalash-repo \
 echo -e "${YELLOW}Configuring Docker authentication...${NC}"
 gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
 
-# Image URLs
-AGENT_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/kalash-repo/${AGENT_SERVICE}:latest"
-CLOUDAPP_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/kalash-repo/${CLOUDAPP_SERVICE}:latest"
+# Image URL
+AGENT_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/kalash-repo/${SERVICE}:latest"
 
-# Build and push Agent image
-echo -e "${YELLOW}Building and pushing Agent image...${NC}"
+# Build and push unified agent image
+echo -e "${YELLOW}Building and pushing unified agent image...${NC}"
 docker build -f Dockerfile.agent -t $AGENT_IMAGE .
 docker push $AGENT_IMAGE
 
-# Build and push CloudApp image
-echo -e "${YELLOW}Building and pushing CloudApp image...${NC}"
-docker build -f Dockerfile.cloudapp -t $CLOUDAPP_IMAGE .
-docker push $CLOUDAPP_IMAGE
-
-# Deploy Agent service first (CloudApp depends on it)
-echo -e "${YELLOW}Deploying Agent service...${NC}"
-gcloud run deploy $AGENT_SERVICE \
+# Deploy unified agent service (FastWorkflow + CloudApp in one container)
+echo -e "${YELLOW}Deploying unified agent service...${NC}"
+gcloud run deploy $SERVICE \
     --image $AGENT_IMAGE \
-    --platform managed \
+    --region $REGION \
     --allow-unauthenticated \
-    --memory 1Gi \
+    --memory 2Gi \
     --cpu 1 \
-    --timeout 300
+    --port 8080 \
+    --timeout 300 \
+    --update-secrets="SECRET_KEY=jwt_secret_key:latest,JWT_SECRET_KEY=jwt_secret_key:latest,WHATSAPP_VERIFY_TOKEN=whatsapp_verify_token:latest,WHATSAPP_PHONE_NUMBER_ID=whatsapp_phone_number_id:latest,WHATSAPP_ACCESS_TOKEN=whatsapp_access_token:latest"
 
-# Get Agent URL
-AGENT_URL=$(gcloud run services describe $AGENT_SERVICE --format='value(status.url)')
-echo -e "${GREEN}Agent deployed at: $AGENT_URL${NC}"
-
-# Deploy CloudApp service with environment variables
-echo -e "${YELLOW}Deploying CloudApp service...${NC}"
-gcloud run deploy $CLOUDAPP_SERVICE \
-    --image $CLOUDAPP_IMAGE \
-    --platform managed \
-    --allow-unauthenticated \
-    --memory 512Mi \
-    --cpu 1 \
-    --timeout 60 \
-    --set-env-vars "FASTWORKFLOW_URL=$AGENT_URL,WHATSAPP_VERIFY_TOKEN=$WHATSAPP_VERIFY_TOKEN,WHATSAPP_PHONE_NUMBER_ID=$WHATSAPP_PHONE_NUMBER_ID,WHATSAPP_ACCESS_TOKEN=$WHATSAPP_ACCESS_TOKEN,FACTORY_WHATSAPP=$FACTORY_WHATSAPP"
-
-# Get CloudApp URL
-CLOUDAPP_URL=$(gcloud run services describe $CLOUDAPP_SERVICE --format='value(status.url)')
-echo -e "${GREEN}CloudApp deployed at: $CLOUDAPP_URL${NC}"
-
-# Update Agent with CloudApp URL
-echo -e "${YELLOW}Updating Agent with CloudApp URL...${NC}"
-gcloud run deploy $AGENT_SERVICE \
-    --image $AGENT_IMAGE \
-    --platform managed \
-    --set-env-vars "CLOUD_APP_URL=$CLOUDAPP_URL"
+# Get service URL
+SERVICE_URL=$(gcloud run services describe $SERVICE --region=$REGION --format='value(status.url)')
+echo -e "${GREEN}Agent deployed at: $SERVICE_URL${NC}"
 
 echo ""
 echo -e "${GREEN}=== Deployment Complete ===${NC}"
 echo ""
 echo "Webhook URL for Meta Developer Console:"
-echo -e "${GREEN}${CLOUDAPP_URL}/webhooks/whatsapp${NC}"
+echo -e "${GREEN}${SERVICE_URL}/webhooks/whatsapp${NC}"
 echo ""
 echo "Verify Token:"
 echo -e "${GREEN}${WHATSAPP_VERIFY_TOKEN}${NC}"
 echo ""
+echo "Dashboard:"
+echo -e "${GREEN}${SERVICE_URL}/dashboard${NC}"
+echo ""
 echo "Next steps:"
 echo "1. Go to Meta Developer Console > WhatsApp > Configuration"
-echo "2. Set Webhook URL: ${CLOUDAPP_URL}/webhooks/whatsapp"
+echo "2. Set Webhook URL: ${SERVICE_URL}/webhooks/whatsapp"
 echo "3. Set Verify Token: ${WHATSAPP_VERIFY_TOKEN}"
 echo "4. Subscribe to: messages"
 echo ""
-echo "Test the webhook:"
-echo "  curl ${CLOUDAPP_URL}/health"
+echo "Test the service:"
+echo "  curl ${SERVICE_URL}/health"

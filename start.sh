@@ -1,15 +1,15 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Starting Box Retail Agent..."
+echo "🚀 Starting Box Support Agent..."
 
 # Function to start FastWorkflow
 start_fastworkflow() {
     echo "📦 Starting FastWorkflow on port 8000..."
     fastworkflow run_fastapi_mcp \
-        /app/box_retail_agent \
-        /app/box_retail_agent/fastworkflow.env \
-        /app/box_retail_agent/fastworkflow.passwords.env \
+        /app/box_support_agent \
+        /app/box_support_agent/fastworkflow.env \
+        /app/box_support_agent/fastworkflow.passwords.env \
         --host 0.0.0.0 \
         --port 8000 &
     FASTWORKFLOW_PID=$!
@@ -21,10 +21,13 @@ start_fastworkflow
 
 # Wait for FastWorkflow to be ready
 echo "⏳ Waiting for FastWorkflow to be ready..."
-MAX_RETRIES=30
+MAX_RETRIES=60
 RETRY_COUNT=0
 
-until curl -s http://localhost:8000/health > /dev/null 2>&1 || [ $RETRY_COUNT -eq $MAX_RETRIES ]; do
+# Check TCP connectivity on port 8000 (FastWorkflow has no /health route)
+until curl -s --max-time 2 http://localhost:8000/ > /dev/null 2>&1 || \
+      curl -s --max-time 2 http://localhost:8000/docs > /dev/null 2>&1 || \
+      [ $RETRY_COUNT -eq $MAX_RETRIES ]; do
     RETRY_COUNT=$((RETRY_COUNT + 1))
     echo "Attempt $RETRY_COUNT/$MAX_RETRIES - FastWorkflow not ready yet..."
     sleep 2
@@ -45,7 +48,8 @@ echo "✅ FastWorkflow is ready!"
             echo "⚠️ FastWorkflow (PID $FASTWORKFLOW_PID) crashed! Restarting..."
             start_fastworkflow
             # Wait for it to come back up
-            until curl -s http://localhost:8000/health > /dev/null 2>&1; do
+            until curl -s --max-time 2 http://localhost:8000/ > /dev/null 2>&1 || \
+                  curl -s --max-time 2 http://localhost:8000/docs > /dev/null 2>&1; do
                 sleep 2
             done
             echo "✅ FastWorkflow restarted successfully (PID $FASTWORKFLOW_PID)"
@@ -53,31 +57,6 @@ echo "✅ FastWorkflow is ready!"
     done
 ) &
 
-# Start Translation API in the background
-TRANSLATION_API_PORT="${TRANSLATION_API_PORT:-8081}"
-echo "🌐 Starting Translation API on port $TRANSLATION_API_PORT..."
-uvicorn box_retail_agent.appliation.transaltion.main:app \
-    --host "${TRANSLATION_API_HOST:-0.0.0.0}" \
-    --port "$TRANSLATION_API_PORT" &
-TRANSLATION_PID=$!
-echo "Translation API started with PID $TRANSLATION_PID"
-
-# Wait for Translation API to be ready
-echo "⏳ Waiting for Translation API to be ready..."
-RETRY_COUNT=0
-until curl -s http://localhost:${TRANSLATION_API_PORT}/ > /dev/null 2>&1 || [ $RETRY_COUNT -eq $MAX_RETRIES ]; do
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-    echo "Attempt $RETRY_COUNT/$MAX_RETRIES - Translation API not ready yet..."
-    sleep 2
-done
-
-if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-    echo "❌ Translation API failed to start after $MAX_RETRIES attempts"
-    exit 1
-fi
-
-echo "✅ Translation API is ready!"
-
 # Start CloudApp (WhatsApp webhook) in the foreground
 echo "📱 Starting CloudApp on port 8080..."
-exec uvicorn box_retail_agent.appliation.cloud_app:app --host 0.0.0.0 --port 8080
+exec uvicorn box_support_agent.application.cloud_app:app --host 0.0.0.0 --port 8080

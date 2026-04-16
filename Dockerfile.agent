@@ -1,4 +1,4 @@
-# Unified Dockerfile for Box Retail Agent (FastWorkflow + CloudApp)
+# Unified Dockerfile for Box Support Agent (FastWorkflow + CloudApp)
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -13,7 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 3. Copy application code
-COPY box_retail_agent/ ./box_retail_agent/
+COPY box_support_agent/ ./box_support_agent/
 
 # 4. Copy startup script
 COPY start.sh /app/start.sh
@@ -24,9 +24,9 @@ RUN mkdir -p /app/data
 
 # 6. Pre-train the FastWorkflow application
 RUN python -m fastworkflow.train \
-    /app/box_retail_agent \
-    /app/box_retail_agent/fastworkflow.env \
-    /app/box_retail_agent/fastworkflow.passwords.env
+    /app/box_support_agent \
+    /app/box_support_agent/fastworkflow.env \
+    /app/box_support_agent/fastworkflow.passwords.env
 
 # 7. Set environment variables
 ENV SPEEDDICT_FOLDERNAME=/app/data
@@ -36,19 +36,12 @@ ENV PORT=8000
 # CloudApp runs on port 8080 (public-facing)
 ENV CLOUDAPP_PORT=8080
 ENV CLOUDAPP_HOST=0.0.0.0
-# Translation API runs on port 8081
-ENV TRANSLATION_API_PORT=8081
-ENV TRANSLATION_API_HOST=0.0.0.0
-# Translation API communicates with FastWorkflow FastAPI via localhost
-ENV FASTWORKFLOW_API_URL=http://localhost:8000
 
 # 8. Expose ports
 #    - 8000: FastWorkflow FastAPI (internal)
 #    - 8080: CloudApp/WhatsApp webhook (public — Cloud Run routes here)
-#    - 8081: Translation API
 EXPOSE 8000
 EXPOSE 8080
-EXPOSE 8081
 
 # 9. Start both services via start.sh:
 #    FastWorkflow starts in background → curl polls until ready → CloudApp starts in foreground

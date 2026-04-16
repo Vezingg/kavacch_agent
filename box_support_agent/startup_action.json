@@ -1,0 +1,7 @@
+{
+    "command_name": "initialize_session",
+    "command": "",
+    "parameters": {
+        "customer_phone": ""
+    }
+}

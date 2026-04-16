@@ -79,9 +79,6 @@ FACTORY_WHATSAPP = os.environ.get("FACTORY_WHATSAPP", "919725201616")
 # FastWorkflow URL (runs locally in same container)
 FASTWORKFLOW_URL = "http://localhost:8000"
 
-# Translation API URL (runs locally in same container, port 8081)
-TRANSLATION_API_URL = os.environ.get("TRANSLATION_API_URL", "http://localhost:8081")
-
 app = FastAPI(title="Box Retail WhatsApp Agent")
 
 # ---------------------------------------------------------------------------
@@ -104,9 +101,6 @@ async def _load_from_firestore():
             cs = data.get("control_state")
             if cs:
                 control_state[phone] = cs
-            lang = data.get("language")
-            if lang:
-                user_language[phone] = lang
             count += 1
         logger.info(f"Loaded {count} conversations from Firestore")
     except Exception as e:
@@ -123,7 +117,6 @@ async def _persist_conversation(phone: str):
         await doc_ref.set({
             "messages": conversation_logs.get(phone, []),
             "control_state": control_state.get(phone, "BOT_CONTROL"),
-            "language": user_language.get(phone),
             "updated_at": _gcp_firestore.SERVER_TIMESTAMP,
         })
     except Exception as e:
@@ -139,17 +132,19 @@ async def startup_load_conversations():
 # Session cache: phone → FastWorkflow session data
 session_cache: Dict[str, dict] = {}
 
+# Session generation counter: incremented on each reset so the new session
+# gets a unique channel_id, forcing FastWorkflow to start with a clean slate.
+session_generation: Dict[str, int] = {}
+
 # Message deduplication: track processed WhatsApp message IDs
 # Prevents duplicate processing when WhatsApp retries webhooks
 processed_message_ids: Dict[str, datetime] = {}
 
 # Pending orders awaiting pricing from factory
-# Format: {customer_phone: {"order_summary": str, "products": list, "timestamp": datetime}}
+# Format: {order_id: {"customer_phone": str, "order_summary": str, "products": list, "timestamp": datetime}}
 pending_orders: Dict[str, dict] = {}
 
-# Track which customer the factory is currently replying to
-# When factory sends a message, we check if there's a pending order
-# Format: customer_phone (most recent pending order)
+# current_pricing_request kept for backward compat but no longer used for routing
 current_pricing_request: Optional[str] = None
 
 # Conversation transcripts: phone → [{role, text, timestamp}]
@@ -157,9 +152,6 @@ conversation_logs: Dict[str, list] = {}
 
 # Per-customer control state: phone → "BOT_CONTROL" | "HUMAN_CONTROL"
 control_state: Dict[str, str] = {}
-
-# Per-customer language: phone → "english" | "hindi" | "gujarati" | None
-user_language: Dict[str, Optional[str]] = {}
 
 # Resolution counter: each agent response costs 1
 RESOLUTION_LIMIT: int = int(os.environ.get("RESOLUTION_LIMIT", "500"))
@@ -172,49 +164,18 @@ total_agent_time: float = 0.0
 agent_call_count: int = 0
 
 # ---------------------------------------------------------------------------
-# Welcome message
+# Messages
 # ---------------------------------------------------------------------------
-
-LANGUAGE_PICKER_MESSAGE = """Welcome to Kalash Packaging! 📦
-
-We specialize in:
-• Bakery Boxes (Window Boxes)
-• MDF Boards
-• Drum Boards
-• Cutlery Kits
-
-Please select your language / कृपया अपनी भाषा चुनें / કૃપા કરી તમારી ભાષા પસંદ કરો:
-
-1. English
-2. Hindi (हिंदी)
-3. Gujarati (ગુજરાતી)
-
-Reply with 1, 2, or 3."""
-
-LANGUAGE_MAP = {"1": "english", "2": "hindi", "3": "gujarati"}
-
-WELCOME_MESSAGE = """
-Welcome to Kalash Packaging! 📦
-
-We specialize in:
-• Bakery Boxes (Window Boxes)
-• MDF Boards
-• Drum Boards
-• Cutlery Kits
-
-Ask me about our products, sizes, colors, or customization options!
-
-Type "help" to see what I can do.
-"""
 
 HELP_MESSAGE = """
 Here's what I can help you with:
 
-📦 Product Info - Ask about boxes, boards, or kits
-📏 Sizes - "What sizes are available?"
-🎨 Colors - "What colors do you have?"
-✨ Customization - "Do you offer branding?"
-🛒 Checkout - Say "checkout" to place an order
+\U0001f4e6 Product Info - Ask about boxes, boards, or kits
+\U0001f4cf Sizes - "What sizes are available?"
+\U0001f3a8 Colors - "What colors do you have?"
+\u2728 Customization - "Do you offer branding?"
+\U0001f6d2 Checkout - Say "checkout" to place an order
+\U0001f504 Reset - Say "reset" to start a fresh conversation
 
 Just type your question naturally!
 """
@@ -291,10 +252,15 @@ async def get_or_create_session(phone: str) -> dict:
         return session_cache[phone]
     
     try:
+        # Build a unique channel_id based on the current session generation.
+        # Incrementing the generation on reset ensures FastWorkflow creates a
+        # brand-new session with no prior conversation history.
+        gen = session_generation.get(phone, 0)
+        channel_id = f"whatsapp_{phone}_v{gen}" if gen > 0 else f"whatsapp_{phone}"
         # 120s timeout: FastWorkflow initialization can be slow on first request
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(f"{FASTWORKFLOW_URL}/initialize", json={
-                "channel_id": f"whatsapp_{phone}",
+                "channel_id": channel_id,
                 "user_id": phone
             })
             
@@ -311,13 +277,56 @@ async def get_or_create_session(phone: str) -> dict:
         return {}
 
 
+# Internal FastWorkflow command/context names that must never be exposed to users.
+_INTERNAL_TERMS = {
+    "initialize_session", "what_can_i_do", "what_is_current_context",
+    "reset_context", "go_up", "SupportSession", "command_context",
+}
+
+# Known LLM misspellings of "Kalash" to correct before sending to users.
+# The LLM occasionally hallucinates the company name.
+_COMPANY_NAME_FIXES = [
+    "Kalab", "Kalash'", "Kalsh", "Kalaash", "KalAsh", "Kallash",
+]
+
+def _sanitize_agent_response(response: str) -> str:
+    """Fix company name misspellings and suppress any internal term leakage."""
+    # Correct LLM misspellings of the company name
+    for wrong in _COMPANY_NAME_FIXES:
+        if wrong.lower() in response.lower():
+            response = re.sub(re.escape(wrong), "Kalash", response, flags=re.IGNORECASE)
+            logger.warning(f"Corrected company name misspelling: '{wrong}' → 'Kalash'")
+
+    # Suppress responses that leak internal command/context names
+    lowered = response.lower()
+    if any(term.lower() in lowered for term in _INTERNAL_TERMS):
+        logger.warning("Agent response contained internal terms — suppressed.")
+        return (
+            "Here's what I can help you with:\n\n"
+            "📦 Product Info — Ask about window boxes, MDF boards, drum boards, or cutlery kits\n"
+            "📏 Sizes — \"What sizes are available?\"\n"
+            "🎨 Colors — \"What colors do you have?\"\n"
+            "✨ Customization — \"Do you offer branding or foil stamping?\"\n"
+            "🛒 Add to Cart — \"Add 500 window boxes to my cart\"\n"
+            "👁 View Cart — \"Show me my cart\"\n"
+            "🗑 Remove Item — \"Remove item 2 from my cart\"\n"
+            "❌ Clear Cart — \"Clear my cart\"\n"
+            "✅ Checkout — \"I'm ready to checkout\"\n"
+            "🔄 Reset — Say \"reset\" to start a fresh conversation\n\n"
+            "Just type naturally — I'll understand!"
+        )
+    return response
+
+
 async def chat_with_agent(phone: str, message: str) -> str:
     """Send message to FastWorkflow agent and get response."""
     global total_agent_time, agent_call_count
+
+    is_new_session = phone not in session_cache
     session = await get_or_create_session(phone)
     if not session:
         return "I'm having trouble connecting. Please try again."
-    
+
     try:
         # 120s timeout: Agent processing can take time for complex queries
         async with httpx.AsyncClient(timeout=120) as client:
@@ -326,7 +335,28 @@ async def chat_with_agent(phone: str, message: str) -> str:
             token = session.get('access_token', '')
             if token:
                 headers["Authorization"] = f"Bearer {token}"
-            
+
+            # For new sessions: silently initialize the session with the phone number
+            # so SupportSession is created with the correct phone context.
+            # We do NOT send the init response — the agent's reply to the user's
+            # actual message serves as the natural welcome.
+            if is_new_session:
+                _t_start = time.monotonic()
+                init_resp = await client.post(
+                    f"{FASTWORKFLOW_URL}/invoke_agent",
+                    json={
+                        "user_query": f"initialize session for phone {phone}",
+                        "timeout_seconds": 500
+                    },
+                    headers=headers
+                )
+                _elapsed = time.monotonic() - _t_start
+                total_agent_time += _elapsed
+                agent_call_count += 1
+
+                if init_resp.status_code != 200:
+                    logger.error(f"Session init error (HTTP {init_resp.status_code}): {init_resp.text}")
+
             _t_start = time.monotonic()
             resp = await client.post(
                 f"{FASTWORKFLOW_URL}/invoke_agent",
@@ -339,14 +369,14 @@ async def chat_with_agent(phone: str, message: str) -> str:
             _elapsed = time.monotonic() - _t_start
             total_agent_time += _elapsed
             agent_call_count += 1
-            
+
             if resp.status_code == 200:
                 data = resp.json()
                 # FastWorkflow returns response nested in command_responses array
                 command_responses = data.get("command_responses", [])
                 if command_responses:
-                    return command_responses[0].get("response", "")
-                return data.get("response", "")
+                    return _sanitize_agent_response(command_responses[0].get("response", ""))
+                return _sanitize_agent_response(data.get("response", ""))
             else:
                 logger.error(f"Chat error (HTTP {resp.status_code}): {resp.text}")
                 return "I'm having trouble processing that. Please try again."
@@ -359,42 +389,43 @@ async def chat_with_agent(phone: str, message: str) -> str:
 # Pending Order Management (for pricing flow)
 # ---------------------------------------------------------------------------
 
-def add_pending_order(customer_phone: str, order_summary: str, products: list):
-    """Add a pending order awaiting pricing from factory."""
-    global current_pricing_request
-    
-    pending_orders[customer_phone] = {
+def add_pending_order(customer_phone: str, order_summary: str, products: list, customer_name: str = "Customer") -> str:
+    """Add a pending order awaiting pricing. Returns the unique order_id (ref code)."""
+    import random, string
+    order_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    pending_orders[order_id] = {
+        "customer_phone": customer_phone,
+        "customer_name": customer_name,
         "order_summary": order_summary,
         "products": products,
         "timestamp": datetime.now(),
-        "customer_name": "Customer"  # Can be enhanced to store actual name
     }
-    current_pricing_request = customer_phone
-    logger.info(f"Added pending order for {customer_phone}")
+    logger.info(f"Added pending order {order_id} for {customer_phone}")
+    return order_id
 
 
 def get_pending_order(customer_phone: str) -> Optional[dict]:
-    """Get pending order for a customer."""
-    return pending_orders.get(customer_phone)
+    """Get the most recent pending order for a customer (by phone)."""
+    matches = [
+        (oid, data) for oid, data in pending_orders.items()
+        if data["customer_phone"] == customer_phone
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda x: x[1]["timestamp"])[1]
 
 
-def remove_pending_order(customer_phone: str):
-    """Remove a pending order after pricing is sent."""
-    global current_pricing_request
-    
-    if customer_phone in pending_orders:
-        del pending_orders[customer_phone]
-        if current_pricing_request == customer_phone:
-            current_pricing_request = None
-        logger.info(f"Removed pending order for {customer_phone}")
+def remove_pending_order(order_id: str):
+    """Remove a pending order by its order_id after pricing is sent."""
+    if order_id in pending_orders:
+        del pending_orders[order_id]
+        logger.info(f"Removed pending order {order_id}")
 
 
 def get_oldest_pending_order() -> Optional[tuple]:
-    """Get the oldest pending order (customer_phone, order_data)."""
+    """Get the oldest pending order (order_id, order_data)."""
     if not pending_orders:
         return None
-    
-    # Sort by timestamp and get oldest
     oldest = min(pending_orders.items(), key=lambda x: x[1]["timestamp"])
     return oldest
 
@@ -403,11 +434,11 @@ def cleanup_old_orders(max_age_hours: int = 24):
     """Remove orders older than max_age_hours."""
     cutoff = datetime.now() - timedelta(hours=max_age_hours)
     to_remove = [
-        phone for phone, data in pending_orders.items()
+        order_id for order_id, data in pending_orders.items()
         if data["timestamp"] < cutoff
     ]
-    for phone in to_remove:
-        remove_pending_order(phone)
+    for order_id in to_remove:
+        remove_pending_order(order_id)
 
 
 def cleanup_processed_messages(max_age_minutes: int = 30):
@@ -443,12 +474,12 @@ def get_control_state(phone: str) -> str:
 def set_control_state(phone: str, state: str):
     """Set the control state for a customer conversation."""
     control_state[phone] = state
-    logger.info(f"Control state for {phone} → {state}")
+    logger.info(f"Control state for {phone} \u2192 {state}")
     asyncio.create_task(_persist_conversation(phone))
 
 
 # ---------------------------------------------------------------------------
-# Markdown → WhatsApp Formatter
+# Markdown \u2192 WhatsApp Formatter
 # ---------------------------------------------------------------------------
 
 def _md_table_to_whatsapp(table_lines: list) -> str:
@@ -476,11 +507,10 @@ def _md_table_to_whatsapp(table_lines: list) -> str:
     # Single-column table → plain bullet list
     if len(headers) == 1:
         for row in data_rows:
-            parts.append(f'• {row[0]}')
+            parts.append(f'\u2022 {row[0]}')
         return '\n'.join(parts)
 
     # First column is the "item name", remaining columns are field:value pairs
-    first_col = headers[0]
     rest_headers = headers[1:]
     for row in data_rows:
         name = row[0] if row else ''
@@ -488,7 +518,7 @@ def _md_table_to_whatsapp(table_lines: list) -> str:
         for i, header in enumerate(rest_headers):
             value = row[i + 1] if i + 1 < len(row) else ''
             if value:
-                parts.append(f'  • {header}: {value}')
+                parts.append(f'  \u2022 {header}: {value}')
         parts.append('')  # blank line between items
     # Remove trailing blank line
     while parts and parts[-1] == '':
@@ -550,157 +580,135 @@ async def send_and_log(phone: str, message: str) -> bool:
     return result
 
 
-async def select_language_for_user(phone: str, language: str) -> bool:
-    """Call POST /select_language on the Translation API and store the language."""
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(
-                f"{TRANSLATION_API_URL}/select_language",
-                json={"channel_id": phone, "language": language},
-            )
-        if resp.status_code == 200:
-            user_language[phone] = language
-            logger.info(f"Language set to {language!r} for {phone}")
-            asyncio.create_task(_persist_conversation(phone))
-            return True
-        logger.error(f"select_language failed ({resp.status_code}): {resp.text}")
-        return False
-    except Exception as e:
-        logger.error(f"select_language error: {e}")
-        return False
-
-
-async def chat_via_translation_api(phone: str, message: str) -> str:
-    """Send message through the Translation API (translate → agent → translate back)."""
-    global total_agent_time, agent_call_count
-    try:
-        _t_start = time.monotonic()
-        async with httpx.AsyncClient(timeout=330.0) as client:
-            resp = await client.post(
-                f"{TRANSLATION_API_URL}/chat",
-                json={"channel_id": phone, "message": message},
-            )
-        if resp.status_code == 200:
-            total_agent_time += time.monotonic() - _t_start
-            agent_call_count += 1
-            return resp.json().get("response", "")
-        if resp.status_code == 401:
-            # Session expired — re-initialize then retry once
-            lang = user_language.get(phone, "english")
-            logger.warning(f"Translation API session expired for {phone}, reinitializing as {lang!r}")
-            await select_language_for_user(phone, lang)
-            async with httpx.AsyncClient(timeout=330.0) as client:
-                resp = await client.post(
-                    f"{TRANSLATION_API_URL}/chat",
-                    json={"channel_id": phone, "message": message},
-                )
-            if resp.status_code == 200:
-                total_agent_time += time.monotonic() - _t_start
-                agent_call_count += 1
-                return resp.json().get("response", "")
-        logger.error(f"Translation API chat error ({resp.status_code}): {resp.text}")
-        return "I'm having trouble processing that. Please try again."
-    except Exception as e:
-        logger.error(f"Translation API chat error: {e}")
-        return "I'm having trouble connecting. Please try again."
-
-
 # ---------------------------------------------------------------------------
 # Message Handling
 # ---------------------------------------------------------------------------
 
+async def _forward_order_to_factory(
+    customer_phone: str,
+    order_summary: str,
+    customer_name: str = "Customer",
+    products: list = None,
+):
+    """Forward a completed order to the factory WhatsApp for pricing."""
+    if products is None:
+        products = []
+    order_id = add_pending_order(customer_phone, order_summary, products, customer_name)
+
+    # Build product lines from structured data if available, else fall back to raw summary
+    if products:
+        lines = []
+        for i, p in enumerate(products, 1):
+            line = f"{i}. {p['product_type']}: {p['product_name']}"
+            line += f"\n   Qty: {p['quantity']}"
+            if p.get("notes"):
+                line += f"\n   Notes: {p['notes']}"
+            lines.append(line)
+        products_text = "\n".join(lines)
+    else:
+        products_text = order_summary
+
+    factory_message = (
+        f"📦 *New Pricing Request*\n"
+        f"🔖 Ref: #{order_id}\n\n"
+        f"👤 Customer: {customer_name}\n"
+        f"📞 Phone: {customer_phone}\n\n"
+        f"Selected Products:\n"
+        f"--------------------\n"
+        f"{products_text}\n"
+        f"--------------------\n\n"
+        f"⚡ Reply with the TOTAL PRICE for this order.\n"
+        # f"(Start your reply with #{order_id}: to route it correctly)\n\n"
+        f"Customer phone: {customer_phone}"
+    )
+    await send_whatsapp(FACTORY_WHATSAPP, factory_message)
+    logger.info(f"Order {order_id} forwarded to factory for customer {customer_phone}")
+
+
 async def handle_factory_reply(text: str):
     """
     Handle a reply from the factory with pricing.
-    Forward the pricing to the customer who's waiting.
+    Factory replies must start with the ref code: #XXXXXX: <price>
+    If no ref code is found, falls back to the oldest pending order.
     """
-    global current_pricing_request
-    
-    # Get the customer waiting for pricing
-    if current_pricing_request and current_pricing_request in pending_orders:
-        customer_phone = current_pricing_request
-        order_data = pending_orders[customer_phone]
-        
-        # Format pricing message for customer
-        pricing_message = f"""
-💰 Pricing Update from Kalash Packaging!
+    # Parse ref code from the reply — format: #XXXXXX (6 alphanumeric chars)
+    ref_match = re.match(r'#([A-Z0-9]{6})\b', text.strip(), re.IGNORECASE)
+    order_id = ref_match.group(1).upper() if ref_match else None
+    price_text = text[ref_match.end():].lstrip(': ').strip() if ref_match else text.strip()
 
-{order_data['order_summary']}
-
-📋 Price Quote:
-{text}
-
-Reply 'confirm' to proceed with the order or ask any questions.
-
-Thank you for choosing Kalash Packaging! 🙏
-"""
-        
-        # Log and send to customer
-        log_message(customer_phone, "bot", pricing_message)
-        await send_whatsapp(customer_phone, pricing_message)
-        logger.info(f"Forwarded pricing to customer {customer_phone}")
-        
-        # Remove from pending (or keep for order confirmation)
-        remove_pending_order(customer_phone)
-        
-        # Notify factory
-        await send_whatsapp(
-            FACTORY_WHATSAPP,
-            f"✅ Pricing sent to customer {customer_phone}"
-        )
+    # Resolve the order
+    if order_id and order_id in pending_orders:
+        order_data = pending_orders[order_id]
+        logger.info(f"Factory reply matched order {order_id}")
     else:
-        # No pending order - maybe factory sent unsolicited message
-        logger.warning(f"Factory replied but no pending order: {text}")
+        if order_id:
+            logger.warning(f"Factory used ref #{order_id} but no matching order found — falling back to oldest")
+        oldest = get_oldest_pending_order()
+        if not oldest:
+            logger.warning(f"Factory replied but no pending orders at all: {text}")
+            return
+        order_id, order_data = oldest
+        logger.info(f"Factory reply routed to oldest pending order {order_id} (no/unknown ref)")
+
+    customer_phone = order_data["customer_phone"]
+
+    pricing_message = (
+        "💰 Pricing Update from Kalash Packaging!\n\n"
+        f"{order_data['order_summary']}\n\n"
+        "📋 Price Quote:\n"
+        f"{price_text}\n\n"
+        "Reply 'confirm' to proceed with the order or ask any questions.\n\n"
+        "Thank you for choosing Kalash Packaging! 🙏"
+    )
+
+    log_message(customer_phone, "bot", pricing_message)
+    await send_whatsapp(customer_phone, pricing_message)
+    logger.info(f"Forwarded pricing for order {order_id} to customer {customer_phone}")
+
+    remove_pending_order(order_id)
+
+    await send_whatsapp(
+        FACTORY_WHATSAPP,
+        f"✅ Pricing for order #{order_id} sent to customer {customer_phone}"
+    )
 
 
 async def handle_customer_message(phone: str, text: str, msg_id: str = ""):
     """Handle a message from a customer."""
     stripped = text.strip().lower()
 
-    # ── Language selection: handle 1 / 2 / 3 replies ──────────────────────
-    if stripped in LANGUAGE_MAP:
-        language = LANGUAGE_MAP[stripped]
-        success = await select_language_for_user(phone, language)
-        lang_display = {"english": "English", "hindi": "Hindi (हिंदी)", "gujarati": "Gujarati (ગુજરાતી)"}
-        if success:
-            await send_and_log(phone, f"✅ Language set to {lang_display[language]}!")
-        else:
-            await send_and_log(phone, "Sorry, couldn't set language. Please try again.")
-        return
-
-    # ── Greetings: always show picker + reset language for fresh start ──────
-    if stripped in {"hi", "hello", "hey", "hii"}:
-        user_language.pop(phone, None)
-        await send_and_log(phone, LANGUAGE_PICKER_MESSAGE)
-        return
-
-    # ── If no language chosen yet, ask them to pick one ───────────────────
-    if not user_language.get(phone):
-        await send_and_log(phone, LANGUAGE_PICKER_MESSAGE)
-        return
-
-    # ── Help ───────────────────────────────────────────────────────────────
+    # Help
     if stripped in {"help", "?", "menu"}:
         await send_and_log(phone, HELP_MESSAGE)
         return
 
-    # ── Order confirmation ─────────────────────────────────────────────────
+    # Reset session
+    if stripped == "reset":
+        # Increment the generation counter so the next /initialize call uses a
+        # brand-new channel_id — FastWorkflow will create a completely fresh
+        # session with no prior conversation history.
+        session_generation[phone] = session_generation.get(phone, 0) + 1
+        session_cache.pop(phone, None)
+        await send_and_log(phone, "\U0001f504 Your session has been reset! You can start a fresh conversation now.")
+        return
+
+    # Order confirmation
     if stripped == "confirm":
         await send_and_log(
             phone,
-            "✅ Thank you for confirming your order!\n\n"
+            "\u2705 Thank you for confirming your order!\n\n"
             "Our team will contact you shortly to finalize the details.\n\n"
-            f"📞 You can also reach us at: {FACTORY_WHATSAPP}\n\n"
-            "Thank you for choosing Kalash Packaging! 🙏"
+            f"\U0001f4de You can also reach us at: {FACTORY_WHATSAPP}\n\n"
+            "Thank you for choosing Kalash Packaging! \U0001f64f"
         )
         return
 
-    # ── Typing indicator ───────────────────────────────────────────────────
+    # Typing indicator
     if msg_id:
         await send_typing_indicator(phone, msg_id)
 
-    # ── Route through Translation API (handles translate → agent → translate)
-    response = await chat_via_translation_api(phone, text)
+    # Route directly to FastWorkflow agent
+    response = await chat_with_agent(phone, text)
 
     if response:
         await send_and_log(phone, response)
@@ -810,7 +818,7 @@ async def api_add_pending_order(request: Request):
         products = data.get("products", [])
         
         if not customer_phone or not order_summary:
-            return {"error": "Missing customer_phone or order_summary"}, 400
+            return JSONResponse({"error": "Missing customer_phone or order_summary"}, status_code=400)
         
         add_pending_order(customer_phone, order_summary, products)
         
@@ -818,7 +826,32 @@ async def api_add_pending_order(request: Request):
         
     except Exception as e:
         logger.error(f"Error adding pending order: {e}")
-        return {"error": str(e)}, 500
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/checkout_complete")
+async def api_checkout_complete(request: Request):
+    """
+    Called directly by checkout.py after a successful checkout.
+    Adds the order to pending_orders and forwards it to the factory WhatsApp.
+    This bypasses the unreliable approach of parsing the LLM-reformatted response.
+    """
+    try:
+        data = await request.json()
+        customer_phone = data.get("customer_phone")
+        order_summary = data.get("order_summary")
+        customer_name = data.get("customer_name", "Customer")
+        products = data.get("products", [])
+
+        if not customer_phone or not order_summary:
+            return JSONResponse({"error": "Missing customer_phone or order_summary"}, status_code=400)
+
+        await _forward_order_to_factory(customer_phone, order_summary, customer_name, products)
+        return {"status": "ok"}
+
+    except Exception as e:
+        logger.error(f"checkout_complete error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/api/pending_orders")
@@ -826,14 +859,15 @@ async def api_get_pending_orders():
     """Get all pending orders (for debugging/admin)."""
     return {
         "pending_orders": {
-            phone: {
+            order_id: {
+                "customer_phone": data["customer_phone"],
                 "order_summary": data["order_summary"],
                 "timestamp": data["timestamp"].isoformat(),
             }
-            for phone, data in pending_orders.items()
-        },
-        "current_pricing_request": current_pricing_request
+            for order_id, data in pending_orders.items()
+        }
     }
+    
 
 
 # ---------------------------------------------------------------------------
@@ -889,15 +923,15 @@ async def api_get_conversation(phone: str):
 
 @app.post("/api/toggle/{phone}")
 async def api_toggle_control(phone: str):
-    """Toggle BOT_CONTROL ⇔ HUMAN_CONTROL for a conversation."""
+    """Toggle BOT_CONTROL \u21d4 HUMAN_CONTROL for a conversation."""
     current = get_control_state(phone)
     new_state = "HUMAN_CONTROL" if current == "BOT_CONTROL" else "BOT_CONTROL"
     set_control_state(phone, new_state)
 
     if new_state == "HUMAN_CONTROL":
-        msg = "Please wait, connecting you to our team... 👤"
+        msg = "Please wait, connecting you to our team... \U0001f464"
     else:
-        msg = "Our automated assistant is back. How can I help? 🤖"
+        msg = "Our automated assistant is back. How can I help? \U0001f916"
 
     log_message(phone, "bot", msg)
     await send_whatsapp(phone, msg)
