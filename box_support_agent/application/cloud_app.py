@@ -12,7 +12,7 @@ import json
 import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 from typing import Dict, Optional
 
@@ -78,6 +78,11 @@ FACTORY_WHATSAPP = os.environ.get("FACTORY_WHATSAPP", "919725201616")
 
 # FastWorkflow URL (runs locally in same container)
 FASTWORKFLOW_URL = "http://localhost:8000"
+
+# Image messaging — feature flag for staged rollout (off by default)
+MEDIA_SEND_ENABLED: bool = os.environ.get("MEDIA_SEND_ENABLED", "false").lower() == "true"
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
 
 app = FastAPI(title="Box Retail WhatsApp Agent")
 
@@ -240,6 +245,103 @@ async def send_typing_indicator(to: str, msg_id: str):
         logger.error(f"Meta API rejected typing indicator: {exc.response.text}")
     except Exception as e:
         logger.warning(f"Typing indicator failed (non-critical): {e}")
+
+
+def _validate_image_bytes(content: bytes, claimed_type: str) -> bool:
+    """Validate image magic bytes against the claimed MIME type (OWASP file-upload check)."""
+    if claimed_type == "image/jpeg" and content[:3] == b'\xff\xd8\xff':
+        return True
+    if claimed_type == "image/png" and content[:8] == b'\x89PNG\r\n\x1a\n':
+        return True
+    if claimed_type == "image/webp" and content[:4] == b'RIFF' and content[8:12] == b'WEBP':
+        return True
+    return False
+
+
+def _extract_image_name_from_url(image_url: str) -> Optional[str]:
+    """Extract a readable filename from a URL path, if present."""
+    if not image_url:
+        return None
+    try:
+        path_part = image_url.split("?", 1)[0].rstrip("/")
+        if not path_part:
+            return None
+        name = path_part.rsplit("/", 1)[-1].strip()
+        return name or None
+    except Exception:
+        return None
+
+
+async def _fetch_whatsapp_media_download_info(media_id: str) -> Optional[dict]:
+    """Resolve a WhatsApp media_id to a temporary download URL and mime type."""
+    if not media_id:
+        return None
+    info_url = f"https://graph.facebook.com/v18.0/{media_id}"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(info_url, headers=headers)
+            if resp.status_code != 200:
+                logger.error(f"Failed to fetch media info for {media_id}: {resp.text}")
+                return None
+            data = resp.json()
+            url = data.get("url")
+            if not url:
+                return None
+            return {
+                "url": url,
+                "mime_type": data.get("mime_type", "application/octet-stream"),
+                "filename": data.get("filename") or None,
+            }
+    except Exception as e:
+        logger.error(f"Media info fetch error for {media_id}: {e}")
+        return None
+
+
+async def send_whatsapp_image_url(to: str, image_url: str, caption: str = "") -> bool:
+    """Send a WhatsApp image message via a public URL."""
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "image",
+        "image": {"link": image_url, "caption": caption},
+    }
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code == 200:
+                logger.info(f"Image (URL) sent to {to}")
+                return True
+            logger.error(f"Image (URL) send failed: {resp.text}")
+            return False
+    except Exception as e:
+        logger.error(f"WhatsApp image URL send error: {e}")
+        return False
+
+
+async def send_whatsapp_image_media_id(to: str, media_id: str, caption: str = "") -> bool:
+    """Send a WhatsApp image message via a pre-uploaded media ID."""
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "image",
+        "image": {"id": media_id, "caption": caption},
+    }
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code == 200:
+                logger.info(f"Image (media_id) sent to {to}")
+                return True
+            logger.error(f"Image (media_id) send failed: {resp.text}")
+            return False
+    except Exception as e:
+        logger.error(f"WhatsApp image media_id send error: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -453,15 +555,25 @@ def cleanup_processed_messages(max_age_minutes: int = 30):
 # Conversation State & Logging Helpers
 # ---------------------------------------------------------------------------
 
-def log_message(phone: str, role: str, text: str):
+def log_message(phone: str, role: str, text: str, msg_type: str = "text",
+                media_url: Optional[str] = None, caption: Optional[str] = None,
+                media_name: Optional[str] = None):
     """Append a message to the in-memory conversation transcript."""
     if phone not in conversation_logs:
         conversation_logs[phone] = []
-    conversation_logs[phone].append({
+    entry: dict = {
         "role": role,
         "text": text,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": msg_type,
+    }
+    if media_url is not None:
+        entry["media_url"] = media_url
+    if caption is not None:
+        entry["caption"] = caption
+    if media_name is not None:
+        entry["media_name"] = media_name
+    conversation_logs[phone].append(entry)
     # Persist asynchronously — does not block the caller
     asyncio.create_task(_persist_conversation(phone))
 
@@ -578,6 +690,24 @@ async def send_and_log(phone: str, message: str) -> bool:
     if result:
         resolutions_used += 1
     return result
+
+
+async def send_and_log_image(phone: str, image_url: str = "", media_id: str = "",
+                             caption: str = "", image_name: str = "") -> bool:
+    """Send a WhatsApp image from the dashboard and log it to the transcript."""
+    derived_name = image_name or _extract_image_name_from_url(image_url) or (f"image_{media_id}" if media_id else "")
+    display_text = caption or derived_name or "[Image]"
+    log_message(
+        phone, "bot",
+        display_text,
+        msg_type="image",
+        media_url=image_url if image_url else (f"media:{media_id}" if media_id else None),
+        caption=caption or None,
+        media_name=derived_name or None,
+    )
+    if media_id:
+        return await send_whatsapp_image_media_id(phone, media_id, caption)
+    return await send_whatsapp_image_url(phone, image_url, caption)
 
 
 # ---------------------------------------------------------------------------
@@ -794,6 +924,41 @@ async def webhook(request: Request):
                         # (fire-and-forget via create_task causes Cloud Run
                         #  to kill the container when no requests are active)
                         await handle_message(phone, text, msg_id)
+
+                    elif msg.get("type") == "image":
+                        phone = msg["from"]
+                        msg_id = msg.get("id", "")
+                        image_info = msg.get("image", {})
+                        caption = image_info.get("caption", "")
+                        media_id = image_info.get("id", "")
+                        media_mime = image_info.get("mime_type", "")
+
+                        if msg_id and msg_id in processed_message_ids:
+                            logger.info(f"Skipping duplicate image message {msg_id}")
+                            return {"status": "ok"}
+                        if msg_id:
+                            processed_message_ids[msg_id] = datetime.now()
+                            cleanup_processed_messages()
+
+                        logger.info(f"[CUSTOMER {phone}] Inbound image, media_id={media_id}")
+                        media_name = image_info.get("filename")
+                        if not media_name and media_mime:
+                            ext = media_mime.split("/")[-1] if "/" in media_mime else "img"
+                            media_name = f"image_{media_id[:8]}.{ext}" if media_id else "image"
+
+                        log_message(
+                            phone, "user",
+                            caption or media_name or "[Image]",
+                            msg_type="image",
+                            media_url=f"media:{media_id}" if media_id else None,
+                            caption=caption or None,
+                            media_name=media_name or None,
+                        )
+                        if get_control_state(phone) != "HUMAN_CONTROL":
+                            await send_and_log(
+                                phone,
+                                "I received your image! For the best help, please describe your question in text and I\u2019ll assist you right away. \U0001f60a"
+                            )
                         
     except Exception as e:
         logger.error(f"Webhook processing error: {e}")
@@ -960,6 +1125,122 @@ async def api_agent_send(request: Request):
     if success:
         return {"status": "sent"}
     return JSONResponse({"error": "Failed to send message"}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Media Upload & Image Send Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/media/upload")
+async def api_media_upload(file: UploadFile = File(...)):
+    """Upload an image to the WhatsApp Media API and return the media_id."""
+    if not MEDIA_SEND_ENABLED:
+        return JSONResponse({"error": "Image sending is disabled"}, status_code=403)
+
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        return JSONResponse(
+            {"error": f"Unsupported type '{file.content_type}'. Allowed: JPEG, PNG, WebP"},
+            status_code=400,
+        )
+
+    content = await file.read()
+
+    if len(content) > MAX_IMAGE_SIZE_BYTES:
+        return JSONResponse(
+            {"error": f"File too large ({len(content) // 1024} KB). Maximum is 5 MB."},
+            status_code=400,
+        )
+
+    if not _validate_image_bytes(content, file.content_type):
+        return JSONResponse(
+            {"error": "File content does not match the declared image type"},
+            status_code=400,
+        )
+
+    upload_url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/media"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                upload_url,
+                headers=headers,
+                files={
+                    "file": (file.filename or "image.jpg", content, file.content_type),
+                    "type": (None, file.content_type),
+                    "messaging_product": (None, "whatsapp"),
+                },
+            )
+            if resp.status_code == 200:
+                media_id = resp.json().get("id")
+                logger.info(f"Media uploaded successfully: media_id={media_id}")
+                return {"media_id": media_id}
+            logger.error(f"WhatsApp media upload failed: {resp.text}")
+            return JSONResponse({"error": "WhatsApp media upload failed"}, status_code=500)
+    except Exception as e:
+        logger.error(f"Media upload error: {e}")
+        return JSONResponse({"error": "Upload error"}, status_code=500)
+
+
+@app.post("/api/agent/send_image")
+async def api_agent_send_image(request: Request):
+    """Send an image to a customer from the dashboard during HUMAN_CONTROL takeover."""
+    if not MEDIA_SEND_ENABLED:
+        return JSONResponse({"error": "Image sending is disabled"}, status_code=403)
+
+    data = await request.json()
+    phone = data.get("phone", "").strip()
+    caption = data.get("caption", "").strip()
+    image_url = data.get("image_url", "").strip()
+    media_id = data.get("media_id", "").strip()
+    image_name = data.get("image_name", "").strip()
+
+    if not phone:
+        return JSONResponse({"error": "Missing phone"}, status_code=400)
+    if not image_url and not media_id:
+        return JSONResponse({"error": "Provide image_url or media_id"}, status_code=400)
+
+    if get_control_state(phone) != "HUMAN_CONTROL":
+        return JSONResponse(
+            {"error": "Conversation is not in HUMAN_CONTROL. Toggle takeover first."},
+            status_code=400,
+        )
+
+    success = await send_and_log_image(
+        phone,
+        image_url=image_url,
+        media_id=media_id,
+        caption=caption,
+        image_name=image_name,
+    )
+    if success:
+        return {"status": "sent"}
+    return JSONResponse({"error": "Failed to send image"}, status_code=500)
+
+
+@app.get("/api/media/proxy/{media_id}")
+async def api_media_proxy(media_id: str):
+    """Proxy WhatsApp media by media_id so dashboard can render it like chat images."""
+    info = await _fetch_whatsapp_media_download_info(media_id)
+    if not info:
+        return JSONResponse({"error": "Media not found"}, status_code=404)
+
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(info["url"], headers=headers)
+            if resp.status_code != 200:
+                logger.error(f"Media proxy download failed ({media_id}): {resp.text}")
+                return JSONResponse({"error": "Media download failed"}, status_code=502)
+
+            content_type = resp.headers.get("content-type") or info.get("mime_type") or "application/octet-stream"
+            return Response(
+                content=resp.content,
+                media_type=content_type,
+                headers={"Cache-Control": "private, max-age=60"},
+            )
+    except Exception as e:
+        logger.error(f"Media proxy error for {media_id}: {e}")
+        return JSONResponse({"error": "Media proxy error"}, status_code=500)
 
 
 # ---------------------------------------------------------------------------

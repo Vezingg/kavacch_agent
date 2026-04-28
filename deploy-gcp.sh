@@ -9,7 +9,7 @@
 set -e
 
 # Configuration
-PROJECT_ID="kavacch-agent-lite-491904"
+PROJECT_ID="kavacch-agent-lite-494311"
 REGION="asia-south1"
 SERVICE="kalash-agent"
 

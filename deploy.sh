@@ -21,7 +21,7 @@ echo "📦 Deploying to Cloud Run..."
 echo ""
 
 gcloud run deploy kalash-agent \
-    --image asia-south1-docker.pkg.dev/kavacch-agent-lite-491904/kalash-repo/kalash-agent:latest \
+    --image asia-south1-docker.pkg.dev/kavacch-agent-lite-494311/kalash-repo/kalash-agent:latest \
     --region asia-south1 \
     --allow-unauthenticated \
     --memory 2Gi \
@@ -38,14 +38,14 @@ echo ""
 
 # Test health
 echo "🧪 Testing service..."
-HEALTH=$(curl -s https://kalash-agent-uf5uwjlxjq-el.a.run.app/health)
+HEALTH=$(curl -s https://kalash-agent-yefqdnx46q-el.a.run.app/health)
 echo "   Health: $HEALTH"
 echo ""
 
 if [[ "$HEALTH" == *"healthy"* ]]; then
     echo "✅ Service is healthy!"
     echo ""
-    echo "📱 WhatsApp Webhook: https://kalash-agent-uf5uwjlxjq-el.a.run.app/webhooks/whatsapp"
+    echo "📱 WhatsApp Webhook: https://kalash-agent-yefqdnx46q-el.a.run.app/webhooks/whatsapp"
 else
     echo "⚠️  Warning: Health check failed"
     echo "   Check logs: gcloud run services logs read kalash-agent --region=asia-south1 --limit=50"

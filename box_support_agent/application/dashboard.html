@@ -708,6 +708,192 @@
             margin: 6px 0;
         }
 
+        /* ── Image input panel ── */
+        .img-input-panel {
+            background: #fafafa;
+            border-top: 1px solid #e0e0e0;
+            padding: 10px clamp(12px, 2.2vw, 16px) 8px;
+            flex-shrink: 0;
+        }
+
+        .img-panel-header {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+
+        .img-tab {
+            padding: 4px 11px;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            background: white;
+            font-size: 12px;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        .img-tab.active {
+            background: #4361ee;
+            color: white;
+            border-color: #4361ee;
+        }
+
+        .img-panel-close {
+            margin-left: auto;
+            background: none;
+            border: none;
+            font-size: 16px;
+            line-height: 1;
+            cursor: pointer;
+            color: #aaa;
+            padding: 2px 6px;
+        }
+
+        .img-panel-close:hover {
+            color: #555;
+        }
+
+        .img-url-field {
+            width: 100%;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 8px 10px;
+            font-size: 13px;
+            outline: none;
+            margin-bottom: 8px;
+            font-family: inherit;
+        }
+
+        .img-url-field:focus {
+            border-color: #4361ee;
+        }
+
+        .img-file-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            margin-bottom: 6px;
+        }
+
+        .img-file-label input[type="file"] {
+            display: none;
+        }
+
+        #img-file-name {
+            font-size: 12px;
+            color: #888;
+            padding: 6px 10px;
+            border: 1px dashed #ccc;
+            border-radius: 6px;
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .img-preview {
+            max-width: 110px;
+            max-height: 80px;
+            border-radius: 6px;
+            object-fit: cover;
+            margin-bottom: 6px;
+            border: 1px solid #e0e0e0;
+            display: block;
+        }
+
+        .img-caption-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .img-caption-field {
+            flex: 1;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 8px 10px;
+            font-size: 13px;
+            outline: none;
+            font-family: inherit;
+            min-width: 0;
+        }
+
+        .img-caption-field:focus {
+            border-color: #4361ee;
+        }
+
+        .img-send-btn {
+            padding: 8px 16px;
+            background: #25d366;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: background 0.15s;
+            flex-shrink: 0;
+        }
+
+        .img-send-btn:hover:not(:disabled) {
+            background: #1ebe5d;
+        }
+
+        .img-send-btn:disabled {
+            background: #aaa;
+            cursor: not-allowed;
+        }
+
+        /* Attach button */
+        .attach-btn {
+            min-height: clamp(42px, 5vw, 44px);
+            padding: 0 clamp(10px, 1.6vw, 12px);
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 18px;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s;
+            flex-shrink: 0;
+            line-height: 1;
+        }
+
+        .attach-btn:hover {
+            background: #f0f2f5;
+        }
+
+        .attach-btn.active {
+            background: #eff3ff;
+            border-color: #4361ee;
+        }
+
+        /* Image message bubble */
+        .msg-img {
+            max-width: 100%;
+            max-height: 240px;
+            border-radius: 6px;
+            display: block;
+            object-fit: cover;
+        }
+
+        .msg-img-caption {
+            margin-top: 4px;
+            font-size: 12px;
+            color: #555;
+        }
+
+        .msg-img-placeholder {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: #666;
+            font-size: 13px;
+        }
+
         @media (max-width: 1024px) {
             .sidebar {
                 width: clamp(240px, 32vw, 300px);
@@ -949,6 +1135,43 @@
             return d.innerHTML.replace(/\n/g, '<br>');
         }
 
+        function escAttr(str) {
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
+
+        function renderImageBubble(m) {
+            const mediaUrl = m.media_url || '';
+            const mediaName = m.media_name || '';
+            const caption = m.caption || (m.text !== '[Image]' ? m.text : '') || mediaName || '';
+            const captionHtml = caption
+                ? `<div class="msg-img-caption">${escHtml(caption)}</div>`
+                : '';
+            // Render <img> only when we have a real HTTP(S) URL
+            if (mediaUrl && mediaUrl.startsWith('http')) {
+                return `<img class="msg-img"
+                    src="${escAttr(mediaUrl)}"
+                    alt="${escAttr(caption || 'Image')}"
+                    onerror="this.onerror=null;this.outerHTML='<span class=msg-img-placeholder>\\uD83D\\uDDBC\uFE0F Image unavailable</span>'">
+                ${captionHtml}`;
+            }
+            // media: ID — render through backend proxy so it looks like regular chat images
+            if (mediaUrl.startsWith('media:')) {
+                const mediaId = mediaUrl.slice(6);
+                return `<img class="msg-img"
+                    src="/api/media/proxy/${encodeURIComponent(mediaId)}"
+                    alt="${escAttr(caption || mediaName || 'Image')}"
+                    onerror="this.onerror=null;this.outerHTML='<span class=msg-img-placeholder>\\uD83D\\uDDBC\uFE0F Image unavailable</span>'">
+                ${captionHtml}`;
+            }
+            // Unknown source
+            return `<span class="msg-img-placeholder">\uD83D\uDDBC\uFE0F <em>${caption || mediaName || '[Image]'}</em></span>${captionHtml}`;
+        }
+
         // Configure marked.js and render markdown to HTML
         marked.use({ breaks: true, gfm: true });
         function renderMarkdown(text) {
@@ -1012,21 +1235,58 @@
             const panel = document.getElementById('chat-panel');
             const isHuman = data.state === 'HUMAN_CONTROL';
 
-            const msgs = data.messages.map(m => `
+            const msgs = data.messages.map(m => {
+                let bubbleContent;
+                if (m.type === 'image') {
+                    bubbleContent = renderImageBubble(m);
+                } else if (m.role === 'bot') {
+                    bubbleContent = renderMarkdown(m.text);
+                } else {
+                    bubbleContent = escHtml(m.text);
+                }
+                return `
             <div class="msg-wrapper ${m.role}">
                 <div class="msg-label">${m.role === 'user' ? '👤 Customer' : '🤖 Bot / Factory'}</div>
-                <div class="msg-bubble ${m.role}">${m.role === 'bot' ? renderMarkdown(m.text) : escHtml(m.text)}</div>
+                <div class="msg-bubble ${m.role}">${bubbleContent}</div>
                 <div class="msg-time">${fmtTime(m.timestamp)}</div>
-            </div>`).join('');
+            </div>`;
+            }).join('');
 
             const inputArea = isHuman
-                ? `<div class="input-area">
-                <textarea id="msg-input"
-                    placeholder="Type a reply as Kalash Packaging…"
-                    rows="1"
-                    onkeydown="handleKey(event,'${phone}')"></textarea>
-                <button class="send-btn" id="send-btn" onclick="sendMsg('${phone}')">Send</button>
-               </div>`
+                ? `<div class="img-input-panel" id="img-panel" style="display:none">
+                    <div class="img-panel-header">
+                        <button class="img-tab active" id="tab-url" onclick="switchImgTab('url')">🔗 URL</button>
+                        <button class="img-tab" id="tab-upload" onclick="switchImgTab('upload')">📁 Upload</button>
+                        <button class="img-panel-close" onclick="toggleImgPanel()" title="Close">✕</button>
+                    </div>
+                    <div id="img-url-section">
+                        <input class="img-url-field" id="img-url" type="text"
+                            placeholder="https://example.com/photo.jpg" />
+                    </div>
+                    <div id="img-upload-section" style="display:none">
+                        <label class="img-file-label">
+                            <input type="file" id="img-file" accept="image/jpeg,image/png,image/webp"
+                                onchange="previewFile()" />
+                            <span id="img-file-name">Choose image (JPEG · PNG · WebP, max 5 MB)</span>
+                        </label>
+                        <img id="img-preview" src="" alt="" class="img-preview" style="display:none" />
+                    </div>
+                    <div class="img-caption-row">
+                        <input class="img-caption-field" id="img-caption" type="text"
+                            placeholder="Caption (optional)" />
+                        <button class="img-send-btn" id="img-send-btn"
+                            onclick="sendImage('${phone}')">Send Image</button>
+                    </div>
+                </div>
+                <div class="input-area">
+                    <button class="attach-btn" id="attach-btn" onclick="toggleImgPanel()"
+                        title="Send image">📎</button>
+                    <textarea id="msg-input"
+                        placeholder="Type a reply as Kalash Packaging…"
+                        rows="1"
+                        onkeydown="handleKey(event,'${phone}')"></textarea>
+                    <button class="send-btn" id="send-btn" onclick="sendMsg('${phone}')">Send</button>
+                </div>`
                 : `<div class="input-locked">
                 Toggle "Take Over" to send messages manually
                </div>`;
@@ -1182,6 +1442,106 @@
                 }
             } catch (_) {
                 document.getElementById('last-refresh').textContent = 'Connection lost…';
+            }
+        }
+
+        // ── Image panel ────────────────────────────────────────────────────────
+
+        function toggleImgPanel() {
+            const panel = document.getElementById('img-panel');
+            const btn = document.getElementById('attach-btn');
+            if (!panel) return;
+            const visible = panel.style.display !== 'none';
+            panel.style.display = visible ? 'none' : '';
+            btn?.classList.toggle('active', !visible);
+        }
+
+        function switchImgTab(tab) {
+            const isUrl = tab === 'url';
+            document.getElementById('img-url-section').style.display = isUrl ? '' : 'none';
+            document.getElementById('img-upload-section').style.display = isUrl ? 'none' : '';
+            document.getElementById('tab-url').classList.toggle('active', isUrl);
+            document.getElementById('tab-upload').classList.toggle('active', !isUrl);
+        }
+
+        function previewFile() {
+            const file = document.getElementById('img-file')?.files?.[0];
+            const nameEl = document.getElementById('img-file-name');
+            const preview = document.getElementById('img-preview');
+            if (!file) return;
+            if (nameEl) nameEl.textContent = `${file.name} (${Math.round(file.size / 1024)} KB)`;
+            if (preview) {
+                preview.src = URL.createObjectURL(file);
+                preview.style.display = 'block';
+            }
+        }
+
+        async function sendImage(phone) {
+            const btn = document.getElementById('img-send-btn');
+            const isUrl = document.getElementById('tab-url')?.classList.contains('active');
+            const caption = (document.getElementById('img-caption')?.value || '').trim();
+
+            if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+
+            try {
+                if (isUrl) {
+                    const imageUrl = (document.getElementById('img-url')?.value || '').trim();
+                    if (!imageUrl) { toast('Enter an image URL', true); return; }
+
+                    const imageName = imageUrl
+                        .split('?')[0]
+                        .split('/')
+                        .filter(Boolean)
+                        .pop() || '';
+
+                    const resp = await fetch('/api/agent/send_image', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ phone, image_url: imageUrl, caption, image_name: imageName })
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) { toast('Error: ' + (data.error || 'Send failed'), true); return; }
+                } else {
+                    const fileInput = document.getElementById('img-file');
+                    if (!fileInput?.files?.length) { toast('Choose an image file first', true); return; }
+                    const fileName = fileInput.files[0]?.name || '';
+
+                    const formData = new FormData();
+                    formData.append('file', fileInput.files[0]);
+
+                    const upResp = await fetch('/api/media/upload', { method: 'POST', body: formData });
+                    const upData = await upResp.json();
+                    if (!upResp.ok) { toast('Upload failed: ' + (upData.error || ''), true); return; }
+
+                    const resp = await fetch('/api/agent/send_image', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ phone, media_id: upData.media_id, caption, image_name: fileName })
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) { toast('Error: ' + (data.error || 'Send failed'), true); return; }
+                }
+
+                // Success: reset panel and refresh conversation
+                const urlEl = document.getElementById('img-url');
+                const capEl = document.getElementById('img-caption');
+                const fileEl = document.getElementById('img-file');
+                const nameEl = document.getElementById('img-file-name');
+                const preview = document.getElementById('img-preview');
+                if (urlEl) urlEl.value = '';
+                if (capEl) capEl.value = '';
+                if (fileEl) fileEl.value = '';
+                if (nameEl) nameEl.textContent = 'Choose image (JPEG · PNG · WebP, max 5 MB)';
+                if (preview) { preview.src = ''; preview.style.display = 'none'; }
+                document.getElementById('img-panel').style.display = 'none';
+                document.getElementById('attach-btn')?.classList.remove('active');
+
+                await selectConv(phone);
+                toast('Image sent ✓');
+            } catch (e) {
+                toast('Network error', true);
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = 'Send Image'; }
             }
         }
 

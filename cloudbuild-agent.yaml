@@ -4,7 +4,7 @@ steps:
     args:
       - 'build'
       - '-t'
-      - 'asia-south1-docker.pkg.dev/kavacch-agent-lite-491904/kalash-repo/kalash-agent:latest'
+      - 'asia-south1-docker.pkg.dev/kavacch-agent-lite-494311/kalash-repo/kalash-agent:latest'
       - '-f'
       - 'Dockerfile.agent'
       - '.'
@@ -14,11 +14,11 @@ steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
-      - 'asia-south1-docker.pkg.dev/kavacch-agent-lite-491904/kalash-repo/kalash-agent:latest'
+      - 'asia-south1-docker.pkg.dev/kavacch-agent-lite-494311/kalash-repo/kalash-agent:latest'
     timeout: 600s
 
 images:
-  - 'asia-south1-docker.pkg.dev/kavacch-agent-lite-491904/kalash-repo/kalash-agent:latest'
+  - 'asia-south1-docker.pkg.dev/kavacch-agent-lite-494311/kalash-repo/kalash-agent:latest'
 
 timeout: 2400s
 options:
