@@ -30,6 +30,7 @@ gcloud run deploy kalash-agent \
     --timeout 300 \
     --cpu-boost \
     --no-cpu-throttling \
+    --min-instances=1 \
     --update-secrets="SECRET_KEY=jwt_secret_key:latest,JWT_SECRET_KEY=jwt_secret_key:latest,WHATSAPP_VERIFY_TOKEN=whatsapp_verify_token:latest,WHATSAPP_PHONE_NUMBER_ID=whatsapp_phone_number_id:latest,WHATSAPP_ACCESS_TOKEN=whatsapp_access_token:latest"
 
 echo ""

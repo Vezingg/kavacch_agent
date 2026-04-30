@@ -420,68 +420,66 @@ def _sanitize_agent_response(response: str) -> str:
     return response
 
 
+async def _do_agent_call(phone: str, message: str, session: dict, is_new_session: bool) -> httpx.Response:
+    """Execute the FastWorkflow /invoke_agent call(s) and return the final response."""
+    global total_agent_time, agent_call_count
+    async with httpx.AsyncClient(timeout=120) as client:
+        headers = {}
+        token = session.get('access_token', '')
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        if is_new_session:
+            _t_start = time.monotonic()
+            init_resp = await client.post(
+                f"{FASTWORKFLOW_URL}/invoke_agent",
+                json={"user_query": f"initialize session for phone {phone}", "timeout_seconds": 500},
+                headers=headers,
+            )
+            total_agent_time += time.monotonic() - _t_start
+            agent_call_count += 1
+            if init_resp.status_code != 200:
+                logger.error(f"Session init error (HTTP {init_resp.status_code}): {init_resp.text}")
+
+        _t_start = time.monotonic()
+        resp = await client.post(
+            f"{FASTWORKFLOW_URL}/invoke_agent",
+            json={"user_query": message, "timeout_seconds": 500},
+            headers=headers,
+        )
+        total_agent_time += time.monotonic() - _t_start
+        agent_call_count += 1
+        return resp
+
+
 async def chat_with_agent(phone: str, message: str) -> str:
     """Send message to FastWorkflow agent and get response."""
-    global total_agent_time, agent_call_count
-
     is_new_session = phone not in session_cache
     session = await get_or_create_session(phone)
     if not session:
         return "I'm having trouble connecting. Please try again."
 
     try:
-        # 120s timeout: Agent processing can take time for complex queries
-        async with httpx.AsyncClient(timeout=120) as client:
-            # Build headers - only add Authorization if token exists
-            headers = {}
-            token = session.get('access_token', '')
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
+        resp = await _do_agent_call(phone, message, session, is_new_session)
 
-            # For new sessions: silently initialize the session with the phone number
-            # so SupportSession is created with the correct phone context.
-            # We do NOT send the init response — the agent's reply to the user's
-            # actual message serves as the natural welcome.
-            if is_new_session:
-                _t_start = time.monotonic()
-                init_resp = await client.post(
-                    f"{FASTWORKFLOW_URL}/invoke_agent",
-                    json={
-                        "user_query": f"initialize session for phone {phone}",
-                        "timeout_seconds": 500
-                    },
-                    headers=headers
-                )
-                _elapsed = time.monotonic() - _t_start
-                total_agent_time += _elapsed
-                agent_call_count += 1
+        # JWT expired — evict stale session and retry once with a fresh one
+        if resp.status_code == 401:
+            logger.warning(f"JWT expired for {phone} — refreshing session and retrying")
+            session_cache.pop(phone, None)
+            session = await get_or_create_session(phone)
+            if not session:
+                return "I'm having trouble connecting. Please try again."
+            resp = await _do_agent_call(phone, message, session, is_new_session=True)
 
-                if init_resp.status_code != 200:
-                    logger.error(f"Session init error (HTTP {init_resp.status_code}): {init_resp.text}")
-
-            _t_start = time.monotonic()
-            resp = await client.post(
-                f"{FASTWORKFLOW_URL}/invoke_agent",
-                json={
-                    "user_query": message,
-                    "timeout_seconds": 500
-                },
-                headers=headers
-            )
-            _elapsed = time.monotonic() - _t_start
-            total_agent_time += _elapsed
-            agent_call_count += 1
-
-            if resp.status_code == 200:
-                data = resp.json()
-                # FastWorkflow returns response nested in command_responses array
-                command_responses = data.get("command_responses", [])
-                if command_responses:
-                    return _sanitize_agent_response(command_responses[0].get("response", ""))
-                return _sanitize_agent_response(data.get("response", ""))
-            else:
-                logger.error(f"Chat error (HTTP {resp.status_code}): {resp.text}")
-                return "I'm having trouble processing that. Please try again."
+        if resp.status_code == 200:
+            data = resp.json()
+            command_responses = data.get("command_responses", [])
+            if command_responses:
+                return _sanitize_agent_response(command_responses[0].get("response", ""))
+            return _sanitize_agent_response(data.get("response", ""))
+        else:
+            logger.error(f"Chat error (HTTP {resp.status_code}): {resp.text}")
+            return "I'm having trouble processing that. Please try again."
     except Exception as e:
         logger.error(f"Chat error: {type(e).__name__}: {str(e)}")
         return "I'm having trouble connecting. Please try again."
