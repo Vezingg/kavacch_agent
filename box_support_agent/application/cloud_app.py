@@ -168,6 +168,17 @@ resolutions_used: int = 0
 total_agent_time: float = 0.0
 agent_call_count: int = 0
 
+# Per-phone asyncio locks: serialises back-to-back messages from the same
+# customer so FastWorkflow never receives concurrent requests for one session.
+_phone_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _get_phone_lock(phone: str) -> asyncio.Lock:
+    if phone not in _phone_locks:
+        _phone_locks[phone] = asyncio.Lock()
+    return _phone_locks[phone]
+
+
 # ---------------------------------------------------------------------------
 # Messages
 # ---------------------------------------------------------------------------
@@ -831,15 +842,18 @@ async def handle_customer_message(phone: str, text: str, msg_id: str = ""):
         )
         return
 
-    # Typing indicator
+    # Typing indicator — sent before acquiring the lock so the user sees
+    # immediate read-receipt feedback even if a prior message is still processing.
     if msg_id:
         await send_typing_indicator(phone, msg_id)
 
-    # Route directly to FastWorkflow agent
-    response = await chat_with_agent(phone, text)
-
-    if response:
-        await send_and_log(phone, response)
+    # Serialise agent calls per phone: prevents FastWorkflow concurrency errors
+    # when the customer sends messages back-to-back.  The lock is held for the
+    # full round-trip (agent call + WhatsApp send) so replies arrive in order.
+    async with _get_phone_lock(phone):
+        response = await chat_with_agent(phone, text)
+        if response:
+            await send_and_log(phone, response)
 
 
 async def handle_message(phone: str, text: str, msg_id: str = ""):
