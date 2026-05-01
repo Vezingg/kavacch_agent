@@ -237,6 +237,11 @@
             color: #e65100;
         }
 
+        .pill-awaiting {
+            background: #fff8e1;
+            color: #f57f17;
+        }
+
         .no-convs {
             padding: clamp(32px, 6vw, 48px) clamp(16px, 3vw, 20px);
             text-align: center;
@@ -781,7 +786,8 @@
             display: none;
         }
 
-        #img-file-name {
+        #img-file-name,
+        #pdf-file-name {
             font-size: 12px;
             color: #888;
             padding: 6px 10px;
@@ -892,6 +898,27 @@
             gap: 6px;
             color: #666;
             font-size: 13px;
+        }
+
+        /* PDF document bubble */
+        .msg-doc-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: #e8eaf6;
+            border: 1px solid #c5cae9;
+            border-radius: 8px;
+            padding: 7px 12px;
+            font-size: 13px;
+            font-weight: 600;
+            color: #283593;
+            word-break: break-all;
+        }
+
+        .msg-doc-caption {
+            margin-top: 4px;
+            font-size: 12px;
+            color: #555;
         }
 
         @media (max-width: 1024px) {
@@ -1110,6 +1137,26 @@
         let selectedPhone = null;
         let conversations = {};
         let lastMsgCount = {};
+        let initialPollDone = false;
+
+        // ── Notifications ──────────────────────────────────────────────────────
+
+        function requestNotificationPermission() {
+            if ('Notification' in window && Notification.permission === 'default') {
+                Notification.requestPermission();
+            }
+        }
+
+        function fireNotification(title, body, tag) {
+            if (!('Notification' in window) || Notification.permission !== 'granted') return;
+            const n = new Notification(title, {
+                body,
+                tag,          // same tag replaces previous notification for same phone
+                silent: false,
+            });
+            n.onclick = () => { window.focus(); n.close(); };
+            setTimeout(() => n.close(), 8000);
+        }
 
         // ── Utilities ──────────────────────────────────────────────────────────
 
@@ -1178,6 +1225,15 @@
             return marked.parse(text);
         }
 
+        function renderDocumentBubble(m) {
+            const docName = m.media_name || m.text || 'document.pdf';
+            const caption = m.caption || '';
+            const captionHtml = caption
+                ? `<div class="msg-doc-caption">${escHtml(caption)}</div>`
+                : '';
+            return `<div class="msg-doc-pill">📄 ${escHtml(docName)}</div>${captionHtml}`;
+        }
+
         function toast(msg, isError = false) {
             const el = document.getElementById('toast');
             el.textContent = msg;
@@ -1209,6 +1265,7 @@
                 const c = convs[phone];
                 const isActive = phone === selectedPhone;
                 const isHuman = c.state === 'HUMAN_CONTROL';
+                const isAwaiting = c.awaiting_confirmation === true;
                 const preview = c.last_message ? c.last_message.text.replace(/\n/g, ' ').slice(0, 45) : 'No messages';
                 const time = c.last_message ? fmtTime(c.last_message.timestamp) : '';
                 const hasNew = (lastMsgCount[phone] !== undefined)
@@ -1225,6 +1282,7 @@
                     <span class="state-pill ${isHuman ? 'pill-human' : 'pill-bot'}">
                         ${isHuman ? '🔴 Human' : '🟢 Bot'}
                     </span>
+                    ${isAwaiting ? '<span class="state-pill pill-awaiting">⏳ Awaiting Confirm</span>' : ''}
                 </div>`;
             }).join('');
         }
@@ -1239,6 +1297,8 @@
                 let bubbleContent;
                 if (m.type === 'image') {
                     bubbleContent = renderImageBubble(m);
+                } else if (m.type === 'document') {
+                    bubbleContent = renderDocumentBubble(m);
                 } else if (m.role === 'bot') {
                     bubbleContent = renderMarkdown(m.text);
                 } else {
@@ -1255,27 +1315,38 @@
             const inputArea = isHuman
                 ? `<div class="img-input-panel" id="img-panel" style="display:none">
                     <div class="img-panel-header">
-                        <button class="img-tab active" id="tab-url" onclick="switchImgTab('url')">🔗 URL</button>
-                        <button class="img-tab" id="tab-upload" onclick="switchImgTab('upload')">📁 Upload</button>
+                        <button class="img-tab active" id="tab-photo" onclick="switchImgTab('photo')">📷 Photo</button>
+                        <button class="img-tab" id="tab-pdf" onclick="switchImgTab('pdf')">📄 PDF</button>
                         <button class="img-panel-close" onclick="toggleImgPanel()" title="Close">✕</button>
                     </div>
-                    <div id="img-url-section">
-                        <input class="img-url-field" id="img-url" type="text"
-                            placeholder="https://example.com/photo.jpg" />
-                    </div>
-                    <div id="img-upload-section" style="display:none">
+                    <div id="img-upload-section">
                         <label class="img-file-label">
                             <input type="file" id="img-file" accept="image/jpeg,image/png,image/webp"
                                 onchange="previewFile()" />
-                            <span id="img-file-name">Choose image (JPEG · PNG · WebP, max 5 MB)</span>
+                            <span id="img-file-name">Choose photo (JPEG · PNG · WebP, max 30 MB)</span>
                         </label>
                         <img id="img-preview" src="" alt="" class="img-preview" style="display:none" />
                     </div>
-                    <div class="img-caption-row">
+                    <div id="pdf-section" style="display:none">
+                        <div id="pdf-upload-section">
+                            <label class="img-file-label">
+                                <input type="file" id="pdf-file" accept="application/pdf"
+                                    onchange="previewPdfFile()" />
+                                <span id="pdf-file-name">Choose PDF (max 25 MB)</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="img-caption-row" id="img-caption-row">
                         <input class="img-caption-field" id="img-caption" type="text"
                             placeholder="Caption (optional)" />
                         <button class="img-send-btn" id="img-send-btn"
-                            onclick="sendImage('${phone}')">Send Image</button>
+                            onclick="sendImage('${phone}')">Send Photo</button>
+                    </div>
+                    <div class="img-caption-row" id="pdf-caption-row" style="display:none">
+                        <input class="img-caption-field" id="pdf-caption" type="text"
+                            placeholder="Caption (optional)" />
+                        <button class="img-send-btn" id="pdf-send-btn"
+                            onclick="sendPdf('${phone}')">Send PDF</button>
                     </div>
                 </div>
                 <div class="input-area">
@@ -1434,6 +1505,36 @@
                     }
                 }
 
+                // Fire desktop notifications for new conversations / new messages
+                if (initialPollDone) {
+                    const tabFocused = document.visibilityState === 'visible';
+                    for (const phone in data) {
+                        const isNewPhone = lastMsgCount[phone] === undefined;
+                        const hasNewMsg = !isNewPhone && data[phone].message_count > (lastMsgCount[phone] ?? 0);
+                        const lastMsg = data[phone].last_message;
+                        const isUserMsg = lastMsg?.role === 'user';
+                        const isActiveAndFocused = tabFocused && phone === selectedPhone;
+
+                        if (isNewPhone && isUserMsg) {
+                            // Brand-new number — always notify
+                            fireNotification(
+                                '📞 New Conversation',
+                                `${fmtPhone(phone)} started a conversation`,
+                                `new-conv-${phone}`
+                            );
+                        } else if (hasNewMsg && isUserMsg && !isActiveAndFocused) {
+                            // New message from known number, tab not focused on this chat
+                            const preview = (lastMsg?.text || '').replace(/\n/g, ' ').slice(0, 70);
+                            fireNotification(
+                                fmtPhone(phone),
+                                preview || 'New message',
+                                `msg-${phone}`
+                            );
+                        }
+                    }
+                }
+                initialPollDone = true;
+
                 // Seed counts for unread tracking (but don't overwrite known ones)
                 for (const phone in data) {
                     if (phone !== selectedPhone && lastMsgCount[phone] === undefined) {
@@ -1457,11 +1558,17 @@
         }
 
         function switchImgTab(tab) {
-            const isUrl = tab === 'url';
-            document.getElementById('img-url-section').style.display = isUrl ? '' : 'none';
-            document.getElementById('img-upload-section').style.display = isUrl ? 'none' : '';
-            document.getElementById('tab-url').classList.toggle('active', isUrl);
-            document.getElementById('tab-upload').classList.toggle('active', !isUrl);
+            const isPdf = tab === 'pdf';
+            // Photo section
+            document.getElementById('img-upload-section').style.display = isPdf ? 'none' : '';
+            // PDF section
+            document.getElementById('pdf-section').style.display = isPdf ? '' : 'none';
+            // Caption / send row
+            document.getElementById('img-caption-row').style.display = isPdf ? 'none' : '';
+            document.getElementById('pdf-caption-row').style.display = isPdf ? '' : 'none';
+            // Tab active states
+            document.getElementById('tab-photo').classList.toggle('active', !isPdf);
+            document.getElementById('tab-pdf').classList.toggle('active', isPdf);
         }
 
         function previewFile() {
@@ -1478,60 +1585,38 @@
 
         async function sendImage(phone) {
             const btn = document.getElementById('img-send-btn');
-            const isUrl = document.getElementById('tab-url')?.classList.contains('active');
             const caption = (document.getElementById('img-caption')?.value || '').trim();
 
             if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
 
             try {
-                if (isUrl) {
-                    const imageUrl = (document.getElementById('img-url')?.value || '').trim();
-                    if (!imageUrl) { toast('Enter an image URL', true); return; }
+                const fileInput = document.getElementById('img-file');
+                if (!fileInput?.files?.length) { toast('Choose a photo file first', true); return; }
+                const fileName = fileInput.files[0]?.name || '';
 
-                    const imageName = imageUrl
-                        .split('?')[0]
-                        .split('/')
-                        .filter(Boolean)
-                        .pop() || '';
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
 
-                    const resp = await fetch('/api/agent/send_image', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ phone, image_url: imageUrl, caption, image_name: imageName })
-                    });
-                    const data = await resp.json();
-                    if (!resp.ok) { toast('Error: ' + (data.error || 'Send failed'), true); return; }
-                } else {
-                    const fileInput = document.getElementById('img-file');
-                    if (!fileInput?.files?.length) { toast('Choose an image file first', true); return; }
-                    const fileName = fileInput.files[0]?.name || '';
+                const upResp = await fetch('/api/media/upload', { method: 'POST', body: formData });
+                const upData = await upResp.json();
+                if (!upResp.ok) { toast('Upload failed: ' + (upData.error || ''), true); return; }
 
-                    const formData = new FormData();
-                    formData.append('file', fileInput.files[0]);
-
-                    const upResp = await fetch('/api/media/upload', { method: 'POST', body: formData });
-                    const upData = await upResp.json();
-                    if (!upResp.ok) { toast('Upload failed: ' + (upData.error || ''), true); return; }
-
-                    const resp = await fetch('/api/agent/send_image', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ phone, media_id: upData.media_id, caption, image_name: fileName })
-                    });
-                    const data = await resp.json();
-                    if (!resp.ok) { toast('Error: ' + (data.error || 'Send failed'), true); return; }
-                }
+                const resp = await fetch('/api/agent/send_image', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phone, media_id: upData.media_id, caption, image_name: fileName })
+                });
+                const data = await resp.json();
+                if (!resp.ok) { toast('Error: ' + (data.error || 'Send failed'), true); return; }
 
                 // Success: reset panel and refresh conversation
-                const urlEl = document.getElementById('img-url');
                 const capEl = document.getElementById('img-caption');
                 const fileEl = document.getElementById('img-file');
                 const nameEl = document.getElementById('img-file-name');
                 const preview = document.getElementById('img-preview');
-                if (urlEl) urlEl.value = '';
                 if (capEl) capEl.value = '';
                 if (fileEl) fileEl.value = '';
-                if (nameEl) nameEl.textContent = 'Choose image (JPEG · PNG · WebP, max 5 MB)';
+                if (nameEl) nameEl.textContent = 'Choose photo (JPEG · PNG · WebP, max 30 MB)';
                 if (preview) { preview.src = ''; preview.style.display = 'none'; }
                 document.getElementById('img-panel').style.display = 'none';
                 document.getElementById('attach-btn')?.classList.remove('active');
@@ -1541,7 +1626,61 @@
             } catch (e) {
                 toast('Network error', true);
             } finally {
-                if (btn) { btn.disabled = false; btn.textContent = 'Send Image'; }
+                if (btn) { btn.disabled = false; btn.textContent = 'Send Photo'; }
+            }
+        }
+
+        // ── PDF panel ──────────────────────────────────────────────────────────
+
+        function previewPdfFile() {
+            const file = document.getElementById('pdf-file')?.files?.[0];
+            const nameEl = document.getElementById('pdf-file-name');
+            if (!file) return;
+            if (nameEl) nameEl.textContent = `${file.name} (${Math.round(file.size / (1024 * 1024) * 10) / 10} MB)`;
+        }
+
+        async function sendPdf(phone) {
+            const btn = document.getElementById('pdf-send-btn');
+            const caption = (document.getElementById('pdf-caption')?.value || '').trim();
+
+            if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+
+            try {
+                const fileInput = document.getElementById('pdf-file');
+                if (!fileInput?.files?.length) { toast('Choose a PDF file first', true); return; }
+                const fileName = fileInput.files[0]?.name || 'document.pdf';
+
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+
+                const upResp = await fetch('/api/media/upload_pdf', { method: 'POST', body: formData });
+                const upData = await upResp.json();
+                if (!upResp.ok) { toast('Upload failed: ' + (upData.error || ''), true); return; }
+
+                const resp = await fetch('/api/agent/send_pdf', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phone, media_id: upData.media_id, caption, pdf_name: fileName })
+                });
+                const data = await resp.json();
+                if (!resp.ok) { toast('Error: ' + (data.error || 'Send failed'), true); return; }
+
+                // Success: reset PDF panel fields and close
+                const capEl = document.getElementById('pdf-caption');
+                const fileEl = document.getElementById('pdf-file');
+                const nameEl = document.getElementById('pdf-file-name');
+                if (capEl) capEl.value = '';
+                if (fileEl) fileEl.value = '';
+                if (nameEl) nameEl.textContent = 'Choose PDF (max 25 MB)';
+                document.getElementById('img-panel').style.display = 'none';
+                document.getElementById('attach-btn')?.classList.remove('active');
+
+                await selectConv(phone);
+                toast('PDF sent ✓');
+            } catch (e) {
+                toast('Network error', true);
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = 'Send PDF'; }
             }
         }
 
@@ -1551,6 +1690,7 @@
             const error = document.getElementById('pw-error');
             if (input.value === 'kalash') {
                 document.getElementById('pw-gate').style.display = 'none';
+                requestNotificationPermission();
                 pollConvs();
                 setInterval(pollConvs, 3000);
             } else {

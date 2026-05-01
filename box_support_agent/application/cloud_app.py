@@ -82,7 +82,11 @@ FASTWORKFLOW_URL = "http://localhost:8000"
 # Image messaging — feature flag for staged rollout (off by default)
 MEDIA_SEND_ENABLED: bool = os.environ.get("MEDIA_SEND_ENABLED", "false").lower() == "true"
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
-MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_IMAGE_SIZE_BYTES = 30 * 1024 * 1024  # 30 MB
+
+# PDF document sending
+ALLOWED_PDF_TYPE = "application/pdf"
+MAX_PDF_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB (Cloud Run hard limit is 32 MB)
 
 app = FastAPI(title="Box Retail WhatsApp Agent")
 
@@ -269,6 +273,11 @@ def _validate_image_bytes(content: bytes, claimed_type: str) -> bool:
     return False
 
 
+def _validate_pdf_bytes(content: bytes) -> bool:
+    """Validate PDF magic bytes (%PDF header) — OWASP file-upload check."""
+    return content[:4] == b'%PDF'
+
+
 def _extract_image_name_from_url(image_url: str) -> Optional[str]:
     """Extract a readable filename from a URL path, if present."""
     if not image_url:
@@ -352,6 +361,56 @@ async def send_whatsapp_image_media_id(to: str, media_id: str, caption: str = ""
             return False
     except Exception as e:
         logger.error(f"WhatsApp image media_id send error: {e}")
+        return False
+
+
+async def send_whatsapp_document_url(to: str, document_url: str, filename: str = "", caption: str = "") -> bool:
+    """Send a WhatsApp document message via a public URL."""
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    payload: dict = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "document",
+        "document": {"link": document_url, "caption": caption},
+    }
+    if filename:
+        payload["document"]["filename"] = filename
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code == 200:
+                logger.info(f"Document (URL) sent to {to}")
+                return True
+            logger.error(f"Document (URL) send failed: {resp.text}")
+            return False
+    except Exception as e:
+        logger.error(f"WhatsApp document URL send error: {e}")
+        return False
+
+
+async def send_whatsapp_document_media_id(to: str, media_id: str, filename: str = "", caption: str = "") -> bool:
+    """Send a WhatsApp document message via a pre-uploaded media ID."""
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    payload: dict = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "document",
+        "document": {"id": media_id, "caption": caption},
+    }
+    if filename:
+        payload["document"]["filename"] = filename
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code == 200:
+                logger.info(f"Document (media_id) sent to {to}")
+                return True
+            logger.error(f"Document (media_id) send failed: {resp.text}")
+            return False
+    except Exception as e:
+        logger.error(f"WhatsApp document media_id send error: {e}")
         return False
 
 
@@ -719,6 +778,24 @@ async def send_and_log_image(phone: str, image_url: str = "", media_id: str = ""
     return await send_whatsapp_image_url(phone, image_url, caption)
 
 
+async def send_and_log_document(phone: str, document_url: str = "", media_id: str = "",
+                                caption: str = "", doc_name: str = "") -> bool:
+    """Send a WhatsApp PDF document from the dashboard and log it to the transcript."""
+    derived_name = doc_name or _extract_image_name_from_url(document_url) or (f"document_{media_id}" if media_id else "document.pdf")
+    display_text = derived_name
+    log_message(
+        phone, "bot",
+        display_text,
+        msg_type="document",
+        media_url=document_url if document_url else (f"media:{media_id}" if media_id else None),
+        caption=caption or None,
+        media_name=derived_name or None,
+    )
+    if media_id:
+        return await send_whatsapp_document_media_id(phone, media_id, derived_name, caption)
+    return await send_whatsapp_document_url(phone, document_url, derived_name, caption)
+
+
 # ---------------------------------------------------------------------------
 # Message Handling
 # ---------------------------------------------------------------------------
@@ -756,7 +833,7 @@ async def _forward_order_to_factory(
         f"--------------------\n"
         f"{products_text}\n"
         f"--------------------\n\n"
-        f"⚡ Reply with the TOTAL PRICE for this order.\n"
+        f"⚡ Reply with the TOTAL PRICE and ESTIMATED DELIVERY TIME for this order.\n"
         # f"(Start your reply with #{order_id}: to route it correctly)\n\n"
         f"Customer phone: {customer_phone}"
     )
@@ -774,6 +851,8 @@ async def handle_factory_reply(text: str):
     ref_match = re.match(r'#([A-Z0-9]{6})\b', text.strip(), re.IGNORECASE)
     order_id = ref_match.group(1).upper() if ref_match else None
     price_text = text[ref_match.end():].lstrip(': ').strip() if ref_match else text.strip()
+    # Strip any stray markdown bold markers the factory may have typed (e.g. **60000**)
+    price_text = price_text.strip('*').strip()
 
     # Resolve the order
     if order_id and order_id in pending_orders:
@@ -791,20 +870,34 @@ async def handle_factory_reply(text: str):
 
     customer_phone = order_data["customer_phone"]
 
+    # Strip the "NEXT STEPS" section from the order summary — that goes in the
+    # confirmation message only, not the pricing quote sent to the customer.
+    raw_summary = order_data['order_summary']
+    next_steps_idx = raw_summary.upper().find('NEXT STEPS')
+    clean_summary = raw_summary[:next_steps_idx].rstrip() if next_steps_idx != -1 else raw_summary
+
+    # Mark the order as awaiting customer confirmation and store the price text
+    # so the confirm/no handlers can include it in the factory notification.
+    pending_orders[order_id]['price_text'] = price_text
+    pending_orders[order_id]['awaiting_confirmation'] = True
+
+    # Use **markdown bold** (not WhatsApp *bold*) so:
+    #   • marked.js in the dashboard renders it as bold HTML
+    #   • markdown_to_whatsapp() inside send_and_log converts ** → * before sending to WhatsApp
     pricing_message = (
         "💰 Pricing Update from Kalash Packaging!\n\n"
-        f"{order_data['order_summary']}\n\n"
-        "📋 Price Quote:\n"
-        f"{price_text}\n\n"
-        "Reply 'confirm' to proceed with the order or ask any questions.\n\n"
+        f"{clean_summary}\n\n"
+        "**📋 Price Quote & Estimated Delivery Time:**\n"
+        f"**{price_text}**\n\n"
+        "Reply 'confirm' to proceed with the order or \"No\" to not confirm order"
+        " or you can ask any questions.\n\n"
         "Thank you for choosing Kalash Packaging! 🙏"
     )
 
-    log_message(customer_phone, "bot", pricing_message)
-    await send_whatsapp(customer_phone, pricing_message)
+    await send_and_log(customer_phone, pricing_message)
     logger.info(f"Forwarded pricing for order {order_id} to customer {customer_phone}")
 
-    remove_pending_order(order_id)
+    # Do NOT remove the pending order yet — it stays until the customer confirms or declines.
 
     await send_whatsapp(
         FACTORY_WHATSAPP,
@@ -833,14 +926,81 @@ async def handle_customer_message(phone: str, text: str, msg_id: str = ""):
 
     # Order confirmation
     if stripped == "confirm":
+        # Find the most-recent pending order for this phone that is awaiting confirmation
+        awaiting = [
+            (oid, data) for oid, data in pending_orders.items()
+            if data.get("customer_phone") == phone and data.get("awaiting_confirmation")
+        ]
+        if awaiting:
+            order_id_conf, order_data_conf = max(awaiting, key=lambda x: x[1]["timestamp"])
+            products_conf = order_data_conf.get("products", [])
+            if products_conf:
+                cart_lines = "\n".join(
+                    f"  {i}. {p['product_type']}: {p['product_name']} x {p['quantity']}"
+                    for i, p in enumerate(products_conf, 1)
+                )
+            else:
+                cart_lines = f"  {order_data_conf.get('order_summary', 'N/A')}"
+            factory_confirm_msg = (
+                f"✅ Order #{order_id_conf} CONFIRMED\n"
+                f"👤 {order_data_conf.get('customer_name', 'Customer')} ({phone})\n\n"
+                f"Items:\n{cart_lines}\n\n"
+                f"Price Quote: {order_data_conf.get('price_text', 'N/A')}"
+            )
+            await send_whatsapp(FACTORY_WHATSAPP, factory_confirm_msg)
+            remove_pending_order(order_id_conf)
+
         await send_and_log(
             phone,
-            "\u2705 Thank you for confirming your order!\n\n"
-            "Our team will contact you shortly to finalize the details.\n\n"
-            f"\U0001f4de You can also reach us at: {FACTORY_WHATSAPP}\n\n"
-            "Thank you for choosing Kalash Packaging! \U0001f64f"
+            "✅ Your order is confirmed\n\n"
+            "NEXT STEPS:\n\n"
+            "Thank you for your interest in Kalash Packaging! 🎉\n\n"
+            "Our team will contact you shortly with:\n"
+            "• Detailed pricing for your order\n"
+            "• Available customization options\n"
+            "• Delivery timeline\n"
+            "• Any additional information you may need\n\n"
+            "Contact Information:\n"
+            "📞 9106845371\n"
+            "📞 7600337948\n\n"
+            "We look forward to serving you!\n\n"
+            "Kalash Packaging Team"
         )
         return
+
+    # Order denial — only intercept when there is an order awaiting confirmation
+    _denial_phrases = {"no", "nope", "cancel", "dont confirm", "don't confirm"}
+    if stripped in _denial_phrases or stripped.startswith("no "):
+        awaiting_den = [
+            (oid, data) for oid, data in pending_orders.items()
+            if data.get("customer_phone") == phone and data.get("awaiting_confirmation")
+        ]
+        if awaiting_den:
+            order_id_den, order_data_den = max(awaiting_den, key=lambda x: x[1]["timestamp"])
+            products_den = order_data_den.get("products", [])
+            if products_den:
+                cart_lines_den = "\n".join(
+                    f"  {i}. {p['product_type']}: {p['product_name']} x {p['quantity']}"
+                    for i, p in enumerate(products_den, 1)
+                )
+            else:
+                cart_lines_den = f"  {order_data_den.get('order_summary', 'N/A')}"
+            factory_denial_msg = (
+                f"❌ Order #{order_id_den} NOT CONFIRMED\n"
+                f"👤 {order_data_den.get('customer_name', 'Customer')} ({phone})\n\n"
+                f"Items:\n{cart_lines_den}\n\n"
+                f"Price Quote: {order_data_den.get('price_text', 'N/A')}"
+            )
+            await send_whatsapp(FACTORY_WHATSAPP, factory_denial_msg)
+            remove_pending_order(order_id_den)
+            await send_and_log(
+                phone,
+                "No problem! Your order has not been placed. 😊\n\n"
+                "Feel free to browse our products or start a new order anytime.\n\n"
+                "Thank you for considering Kalash Packaging!"
+            )
+            return
+        # No awaiting order found — fall through to the agent so "no" works naturally in chat
 
     # Typing indicator — sent before acquiring the lock so the user sees
     # immediate read-receipt feedback even if a prior message is still processing.
@@ -1065,10 +1225,15 @@ async def api_get_conversations():
     result = {}
     for phone, messages in conversation_logs.items():
         last_msg = messages[-1] if messages else None
+        awaiting = any(
+            d.get("customer_phone") == phone and d.get("awaiting_confirmation")
+            for d in pending_orders.values()
+        )
         result[phone] = {
             "state": get_control_state(phone),
             "message_count": len(messages),
-            "last_message": last_msg
+            "last_message": last_msg,
+            "awaiting_confirmation": awaiting,
         }
     return result
 
@@ -1159,7 +1324,7 @@ async def api_media_upload(file: UploadFile = File(...)):
 
     if len(content) > MAX_IMAGE_SIZE_BYTES:
         return JSONResponse(
-            {"error": f"File too large ({len(content) // 1024} KB). Maximum is 5 MB."},
+            {"error": f"File too large ({len(content) // (1024 * 1024)} MB). Maximum is 30 MB."},
             status_code=400,
         )
 
@@ -1190,6 +1355,57 @@ async def api_media_upload(file: UploadFile = File(...)):
             return JSONResponse({"error": "WhatsApp media upload failed"}, status_code=500)
     except Exception as e:
         logger.error(f"Media upload error: {e}")
+        return JSONResponse({"error": "Upload error"}, status_code=500)
+
+
+@app.post("/api/media/upload_pdf")
+async def api_media_upload_pdf(file: UploadFile = File(...)):
+    """Upload a PDF to the WhatsApp Media API and return the media_id."""
+    if not MEDIA_SEND_ENABLED:
+        return JSONResponse({"error": "Document sending is disabled"}, status_code=403)
+
+    if file.content_type != ALLOWED_PDF_TYPE:
+        return JSONResponse(
+            {"error": f"Unsupported type '{file.content_type}'. Only PDF is allowed."},
+            status_code=400,
+        )
+
+    content = await file.read()
+
+    if len(content) > MAX_PDF_SIZE_BYTES:
+        return JSONResponse(
+            {"error": f"File too large ({len(content) // (1024 * 1024)} MB). Maximum is 25 MB."},
+            status_code=400,
+        )
+
+    if not _validate_pdf_bytes(content):
+        return JSONResponse(
+            {"error": "File content does not appear to be a valid PDF"},
+            status_code=400,
+        )
+
+    upload_url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/media"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    safe_filename = file.filename or "document.pdf"
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                upload_url,
+                headers=headers,
+                files={
+                    "file": (safe_filename, content, ALLOWED_PDF_TYPE),
+                    "type": (None, ALLOWED_PDF_TYPE),
+                    "messaging_product": (None, "whatsapp"),
+                },
+            )
+            if resp.status_code == 200:
+                media_id = resp.json().get("id")
+                logger.info(f"PDF uploaded successfully: media_id={media_id}, filename={safe_filename}")
+                return {"media_id": media_id, "filename": safe_filename}
+            logger.error(f"WhatsApp PDF upload failed: {resp.text}")
+            return JSONResponse({"error": "WhatsApp PDF upload failed"}, status_code=500)
+    except Exception as e:
+        logger.error(f"PDF upload error: {e}")
         return JSONResponse({"error": "Upload error"}, status_code=500)
 
 
@@ -1227,6 +1443,42 @@ async def api_agent_send_image(request: Request):
     if success:
         return {"status": "sent"}
     return JSONResponse({"error": "Failed to send image"}, status_code=500)
+
+
+@app.post("/api/agent/send_pdf")
+async def api_agent_send_pdf(request: Request):
+    """Send a PDF document to a customer from the dashboard during HUMAN_CONTROL takeover."""
+    if not MEDIA_SEND_ENABLED:
+        return JSONResponse({"error": "Document sending is disabled"}, status_code=403)
+
+    data = await request.json()
+    phone = data.get("phone", "").strip()
+    caption = data.get("caption", "").strip()
+    pdf_url = data.get("pdf_url", "").strip()
+    media_id = data.get("media_id", "").strip()
+    pdf_name = data.get("pdf_name", "").strip()
+
+    if not phone:
+        return JSONResponse({"error": "Missing phone"}, status_code=400)
+    if not pdf_url and not media_id:
+        return JSONResponse({"error": "Provide pdf_url or media_id"}, status_code=400)
+
+    if get_control_state(phone) != "HUMAN_CONTROL":
+        return JSONResponse(
+            {"error": "Conversation is not in HUMAN_CONTROL. Toggle takeover first."},
+            status_code=400,
+        )
+
+    success = await send_and_log_document(
+        phone,
+        document_url=pdf_url,
+        media_id=media_id,
+        caption=caption,
+        doc_name=pdf_name,
+    )
+    if success:
+        return {"status": "sent"}
+    return JSONResponse({"error": "Failed to send PDF"}, status_code=500)
 
 
 @app.get("/api/media/proxy/{media_id}")
