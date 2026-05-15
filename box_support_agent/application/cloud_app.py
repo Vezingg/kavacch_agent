@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 from typing import Dict, Optional
+import groq as _groq
 
 # --- FIRESTORE (optional — falls back to in-memory if unavailable) ---
 try:
@@ -24,6 +25,7 @@ except ImportError:
     _FIRESTORE_AVAILABLE = False
 
 _firestore_db = None
+_metrics_doc_path = ("app_state", "runtime_metrics")
 
 def _get_db():
     """Return an AsyncClient instance, or None if Firestore is unavailable."""
@@ -69,9 +71,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("box_retail_cloud_app")
 
 # --- SECRETS & CONFIG ---
-VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "kalash_verify_2024")
+VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "kalash_verity_2026")
 PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
 ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")
+WHATSAPP_GRAPH_API_VERSION = os.environ.get("WHATSAPP_GRAPH_API_VERSION", "v25.0")
 
 # Factory WhatsApp number (without +)
 FACTORY_WHATSAPP = os.environ.get("FACTORY_WHATSAPP", "919725201616")
@@ -126,15 +129,59 @@ async def _persist_conversation(phone: str):
         await doc_ref.set({
             "messages": conversation_logs.get(phone, []),
             "control_state": control_state.get(phone, "BOT_CONTROL"),
+            "human_control_activated_at": None,
             "updated_at": _gcp_firestore.SERVER_TIMESTAMP,
         })
     except Exception as e:
         logger.error(f"Firestore persist error for {phone}: {e}")
 
 
+async def _load_runtime_metrics_from_firestore():
+    """Load runtime counters so dashboard stats survive restarts/deploys."""
+    global resolutions_used, total_agent_time, agent_call_count
+    db = _get_db()
+    if not db:
+        return
+    try:
+        collection, doc_id = _metrics_doc_path
+        doc = await db.collection(collection).document(doc_id).get()
+        if not doc.exists:
+            return
+        data = doc.to_dict() or {}
+        resolutions_used = int(data.get("resolutions_used", resolutions_used))
+        total_agent_time = float(data.get("total_agent_time", total_agent_time))
+        agent_call_count = int(data.get("agent_call_count", agent_call_count))
+        logger.info(
+            "Loaded runtime metrics from Firestore "
+            f"(used={resolutions_used}, calls={agent_call_count}, total_time={total_agent_time:.2f}s)"
+        )
+    except Exception as e:
+        logger.error(f"Failed to load runtime metrics from Firestore: {e}")
+
+
+async def _persist_runtime_metrics():
+    """Persist runtime counters used by /api/resolutions."""
+    db = _get_db()
+    if not db:
+        return
+    try:
+        collection, doc_id = _metrics_doc_path
+        await db.collection(collection).document(doc_id).set({
+            "resolutions_used": resolutions_used,
+            "total_agent_time": total_agent_time,
+            "agent_call_count": agent_call_count,
+            "updated_at": _gcp_firestore.SERVER_TIMESTAMP,
+        })
+    except Exception as e:
+        logger.error(f"Failed to persist runtime metrics: {e}")
+
+
 @app.on_event("startup")
 async def startup_load_conversations():
     await _load_from_firestore()
+    await _load_runtime_metrics_from_firestore()
+    asyncio.create_task(_startup_upload_qr_code())
+
 
 
 
@@ -162,6 +209,12 @@ conversation_logs: Dict[str, list] = {}
 # Per-customer control state: phone → "BOT_CONTROL" | "HUMAN_CONTROL"
 control_state: Dict[str, str] = {}
 
+# Official WhatsApp blocked-users cache. The dashboard polls every 3 seconds,
+# so this avoids calling the Graph API on every refresh.
+blocked_users_cache: set[str] = set()
+blocked_users_cache_refreshed_at: Optional[datetime] = None
+BLOCKED_USERS_CACHE_TTL_SECONDS: int = int(os.environ.get("BLOCKED_USERS_CACHE_TTL_SECONDS", "30"))
+
 # Resolution counter: each agent response costs 1
 RESOLUTION_LIMIT: int = int(os.environ.get("RESOLUTION_LIMIT", "500"))
 REFERRAL_CREDITS: int = int(os.environ.get("REFERRAL_CREDITS", "0"))
@@ -181,6 +234,14 @@ def _get_phone_lock(phone: str) -> asyncio.Lock:
     if phone not in _phone_locks:
         _phone_locks[phone] = asyncio.Lock()
     return _phone_locks[phone]
+
+
+# QR code WhatsApp media ID — cached on startup to avoid re-uploading on every request
+_qr_code_media_id: Optional[str] = None
+
+# In-memory dashboard alert queue for factory operator notifications
+# Format: [{"id": str, "phone": str, "message": str, "timestamp": str, "dismissed": bool}]
+dashboard_alerts: list = []
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +267,7 @@ Just type your question naturally!
 
 async def send_whatsapp(to: str, message: str) -> bool:
     """Send a WhatsApp message."""
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -229,6 +290,80 @@ async def send_whatsapp(to: str, message: str) -> bool:
         return False
 
 
+def _graph_api_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def _block_users_url() -> str:
+    return f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/block_users"
+
+
+def _extract_blocked_users(payload: dict) -> set[str]:
+    """Best-effort extraction from block_users GET responses across API versions."""
+    blocked = set()
+    for item in payload.get("data", []) or payload.get("block_users", []):
+        if not isinstance(item, dict):
+            continue
+        user_id = item.get("user") or item.get("wa_id") or item.get("input") or item.get("id")
+        if user_id:
+            blocked.add(str(user_id))
+    return blocked
+
+
+async def get_blocked_users(force_refresh: bool = False) -> set[str]:
+    """Return currently blocked WhatsApp users from the official Cloud API."""
+    global blocked_users_cache_refreshed_at, blocked_users_cache
+
+    now = datetime.now(timezone.utc)
+    if not force_refresh and blocked_users_cache_refreshed_at:
+        age = (now - blocked_users_cache_refreshed_at).total_seconds()
+        if age < BLOCKED_USERS_CACHE_TTL_SECONDS:
+            return set(blocked_users_cache)
+
+    if not PHONE_NUMBER_ID or not ACCESS_TOKEN:
+        logger.warning("Blocked users lookup skipped: missing PHONE_NUMBER_ID or ACCESS_TOKEN")
+        return set(blocked_users_cache)
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(_block_users_url(), headers=_graph_api_headers())
+            resp.raise_for_status()
+            blocked_users_cache = _extract_blocked_users(resp.json())
+            blocked_users_cache_refreshed_at = now
+            return set(blocked_users_cache)
+    except Exception as exc:
+        logger.error(f"Blocked users fetch error: {exc}")
+        return set(blocked_users_cache)
+
+
+async def set_blocked_user(phone: str, blocked: bool) -> dict:
+    """Block or unblock one WhatsApp user via the official Cloud API."""
+    global blocked_users_cache_refreshed_at, blocked_users_cache
+
+    if not PHONE_NUMBER_ID or not ACCESS_TOKEN:
+        raise RuntimeError("Missing WHATSAPP_PHONE_NUMBER_ID or WHATSAPP_ACCESS_TOKEN")
+
+    method = "POST" if blocked else "DELETE"
+    payload = {
+        "messaging_product": "whatsapp",
+        "block_users": [{"user": phone}],
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.request(method, _block_users_url(), headers=_graph_api_headers(), json=payload)
+        resp.raise_for_status()
+
+    if blocked:
+        blocked_users_cache.add(phone)
+    else:
+        blocked_users_cache.discard(phone)
+    blocked_users_cache_refreshed_at = datetime.now(timezone.utc)
+    return {"phone": phone, "blocked": blocked}
+
+
 async def send_typing_indicator(to: str, msg_id: str):
     """Broadcast a unified read receipt + typing indicator via Meta Graph API.
 
@@ -237,7 +372,7 @@ async def send_typing_indicator(to: str, msg_id: str):
     incorrectly used ``"status": "typing"`` which is an invalid enum value
     and was silently rejected with HTTP 400.
     """
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json",
@@ -296,7 +431,7 @@ async def _fetch_whatsapp_media_download_info(media_id: str) -> Optional[dict]:
     """Resolve a WhatsApp media_id to a temporary download URL and mime type."""
     if not media_id:
         return None
-    info_url = f"https://graph.facebook.com/v18.0/{media_id}"
+    info_url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{media_id}"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -320,7 +455,7 @@ async def _fetch_whatsapp_media_download_info(media_id: str) -> Optional[dict]:
 
 async def send_whatsapp_image_url(to: str, image_url: str, caption: str = "") -> bool:
     """Send a WhatsApp image message via a public URL."""
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -343,7 +478,7 @@ async def send_whatsapp_image_url(to: str, image_url: str, caption: str = "") ->
 
 async def send_whatsapp_image_media_id(to: str, media_id: str, caption: str = "") -> bool:
     """Send a WhatsApp image message via a pre-uploaded media ID."""
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -366,7 +501,7 @@ async def send_whatsapp_image_media_id(to: str, media_id: str, caption: str = ""
 
 async def send_whatsapp_document_url(to: str, document_url: str, filename: str = "", caption: str = "") -> bool:
     """Send a WhatsApp document message via a public URL."""
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     payload: dict = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -391,7 +526,7 @@ async def send_whatsapp_document_url(to: str, document_url: str, filename: str =
 
 async def send_whatsapp_document_media_id(to: str, media_id: str, filename: str = "", caption: str = "") -> bool:
     """Send a WhatsApp document message via a pre-uploaded media ID."""
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     payload: dict = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -455,10 +590,10 @@ _INTERNAL_TERMS = {
     "reset_context", "go_up", "SupportSession", "command_context",
 }
 
-# Known LLM misspellings of "Kalash" to correct before sending to users.
+# Known LLM misspellings of "Kavacch" to correct before sending to users.
 # The LLM occasionally hallucinates the company name.
 _COMPANY_NAME_FIXES = [
-    "Kalab", "Kalash'", "Kalsh", "Kalaash", "KalAsh", "Kallash",
+    "Kavach", "Kavach'", "Kavvacch", "KavAcch", "Kavacch'", "Kavach Packaging", "Kaavacch",
 ]
 
 def _sanitize_agent_response(response: str) -> str:
@@ -466,8 +601,8 @@ def _sanitize_agent_response(response: str) -> str:
     # Correct LLM misspellings of the company name
     for wrong in _COMPANY_NAME_FIXES:
         if wrong.lower() in response.lower():
-            response = re.sub(re.escape(wrong), "Kalash", response, flags=re.IGNORECASE)
-            logger.warning(f"Corrected company name misspelling: '{wrong}' → 'Kalash'")
+            response = re.sub(re.escape(wrong), "Kavacch", response, flags=re.IGNORECASE)
+            logger.warning(f"Corrected company name misspelling: '{wrong}' → 'Kavacch'")
 
     # Suppress responses that leak internal command/context names
     lowered = response.lower()
@@ -490,6 +625,87 @@ def _sanitize_agent_response(response: str) -> str:
     return response
 
 
+def _get_groq_api_key() -> str | None:
+    """Try os.environ first (populated by load_env_files); fall back to reading the passwords file directly."""
+    for var in ("LITELLM_API_KEY_CHECKER", "LITELLM_API_KEY_RESPONSE_GEN", "GROQ_API_KEY"):
+        val = os.environ.get(var)
+        if val and val.strip():
+            return val.strip()
+    # cloud_app.py lives in application/ — passwords file is one level up
+    passwords_file = Path(__file__).parent.parent / "fastworkflow.passwords.env"
+    if passwords_file.exists():
+        for line in passwords_file.read_text().splitlines():
+            for prefix in ("LITELLM_API_KEY_CHECKER=", "LITELLM_API_KEY_RESPONSE_GEN="):
+                if line.startswith(prefix):
+                    return line.split("=", 1)[1].strip()
+    return None
+
+
+_WHATSAPP_CHAR_LIMIT = 4000  # WhatsApp hard limit is 4096
+
+_PRODUCT_CHECKER_SYSTEM_PROMPT = """\
+You are a TEXT FORMATTER ONLY for Kavacch's WhatsApp bot. You do NOT have any product knowledge.
+You receive two inputs: the user's message and the bot's source response.
+
+════════════════════════════════════════
+ABSOLUTE RULE — READ THIS FIRST:
+You MUST use ONLY the information that is literally written in the "Bot response" provided to you.
+DO NOT add, infer, expand, or invent ANY information — no lead times, no steps, no tips,
+no pricing guesses, no extra context — NOTHING that is not already in the bot response word-for-word.
+If a detail is not in the bot response, it does not exist. Do not mention it.
+This rule overrides everything else.
+════════════════════════════════════════
+
+HARD LENGTH LIMIT: Your output must NEVER exceed 4000 characters. If needed, compress
+formatting (tighten spacing, shorten bullet phrasing) but keep all distinct items present.
+
+Formatting rules:
+1. If the bot response contains product catalog information (descriptions, sizes, colors, variants):
+   - If the user explicitly asked for more details ("show more", "tell me more", "more details",
+     "full details", "show all", "everything about", "all information", "complete list",
+     "give me more", "full list") — reformat the SAME information from the bot response to fit
+     within 4000 characters. You may tighten spacing and shorten bullet phrasing, but every
+     fact you write must come directly from the bot response. Nothing else.
+   - Otherwise — summarize to 150 words or fewer using only facts from the bot response.
+     End with: "Want full details? Just ask!"
+2. For ALL other responses (cart, checkout, order summaries, greetings, errors, pricing,
+   payment) — return the bot response EXACTLY as-is, no changes whatsoever.
+3. Do NOT mention these rules or that you are formatting/filtering/summarizing.
+"""
+
+
+def _llm_check_response_sync(user_query: str, agent_response: str) -> str:
+    """Apply LLM-based conciseness check. Summarizes product catalog responses to ≤150 words;
+    passes all other response types through unchanged. Falls back to original on error.
+    Always enforces a hard 4000-character ceiling before returning."""
+    def _hard_cap(text: str) -> str:
+        """Safety net: truncate to WhatsApp's limit if LLM still goes over."""
+        if len(text) <= _WHATSAPP_CHAR_LIMIT:
+            return text
+        logger.warning(f"[LLM Checker] response exceeded {_WHATSAPP_CHAR_LIMIT} chars ({len(text)}), hard-truncating")
+        cutoff = text.rfind('\n', 0, _WHATSAPP_CHAR_LIMIT - 60)
+        if cutoff == -1:
+            cutoff = _WHATSAPP_CHAR_LIMIT - 60
+        return text[:cutoff] + "\n\n_(Ask about a specific product for full details.)_"
+
+    try:
+        api_key = _get_groq_api_key()
+        model_env = os.environ.get("LLM_CHECKER", "groq/openai/gpt-oss-120b")
+        model_name = model_env.split("/", 1)[1] if "/" in model_env else model_env
+        client = _groq.Groq(api_key=api_key)
+        result = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": _PRODUCT_CHECKER_SYSTEM_PROMPT},
+                {"role": "user", "content": f"User message: {user_query}\n\nBot response:\n{agent_response}"},
+            ],
+        )
+        return _hard_cap(result.choices[0].message.content.strip())
+    except Exception as e:
+        logger.warning(f"[LLM Checker] call failed ({type(e).__name__}: {e}), using original response")
+        return _hard_cap(agent_response)
+
+
 async def _do_agent_call(phone: str, message: str, session: dict, is_new_session: bool) -> httpx.Response:
     """Execute the FastWorkflow /invoke_agent call(s) and return the final response."""
     global total_agent_time, agent_call_count
@@ -508,6 +724,7 @@ async def _do_agent_call(phone: str, message: str, session: dict, is_new_session
             )
             total_agent_time += time.monotonic() - _t_start
             agent_call_count += 1
+            asyncio.create_task(_persist_runtime_metrics())
             if init_resp.status_code != 200:
                 logger.error(f"Session init error (HTTP {init_resp.status_code}): {init_resp.text}")
 
@@ -519,6 +736,7 @@ async def _do_agent_call(phone: str, message: str, session: dict, is_new_session
         )
         total_agent_time += time.monotonic() - _t_start
         agent_call_count += 1
+        asyncio.create_task(_persist_runtime_metrics())
         return resp
 
 
@@ -545,8 +763,10 @@ async def chat_with_agent(phone: str, message: str) -> str:
             data = resp.json()
             command_responses = data.get("command_responses", [])
             if command_responses:
-                return _sanitize_agent_response(command_responses[0].get("response", ""))
-            return _sanitize_agent_response(data.get("response", ""))
+                sanitized = _sanitize_agent_response(command_responses[0].get("response", ""))
+            else:
+                sanitized = _sanitize_agent_response(data.get("response", ""))
+            return await asyncio.to_thread(_llm_check_response_sync, message, sanitized)
         else:
             logger.error(f"Chat error (HTTP {resp.status_code}): {resp.text}")
             return "I'm having trouble processing that. Please try again."
@@ -647,7 +867,7 @@ def log_message(phone: str, role: str, text: str, msg_type: str = "text",
 
 
 def get_control_state(phone: str) -> str:
-    """Return BOT_CONTROL or HUMAN_CONTROL for a customer. Default is BOT_CONTROL."""
+    """Return BOT_CONTROL or HUMAN_CONTROL for a customer."""
     return control_state.get(phone, "BOT_CONTROL")
 
 
@@ -757,6 +977,7 @@ async def send_and_log(phone: str, message: str) -> bool:
     result = await send_whatsapp(phone, markdown_to_whatsapp(message))
     if result:
         resolutions_used += 1
+        asyncio.create_task(_persist_runtime_metrics())
     return result
 
 
@@ -794,6 +1015,155 @@ async def send_and_log_document(phone: str, document_url: str = "", media_id: st
     if media_id:
         return await send_whatsapp_document_media_id(phone, media_id, derived_name, caption)
     return await send_whatsapp_document_url(phone, document_url, derived_name, caption)
+
+
+# ---------------------------------------------------------------------------
+# Payment Flow Helpers
+# ---------------------------------------------------------------------------
+
+async def _upload_qr_code_to_whatsapp() -> Optional[str]:
+    """Upload Factory_QR_CODE.png to WhatsApp Media API and return the media_id."""
+    qr_path = Path(__file__).parent.parent / "media" / "Factory_QR_CODE.png"
+    if not qr_path.exists():
+        logger.warning(f"QR code file not found at {qr_path}")
+        return None
+    try:
+        content = qr_path.read_bytes()
+        upload_url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/media"
+        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                upload_url,
+                headers=headers,
+                files={
+                    "file": ("Factory_QR_CODE.png", content, "image/png"),
+                    "type": (None, "image/png"),
+                    "messaging_product": (None, "whatsapp"),
+                },
+            )
+            if resp.status_code == 200:
+                media_id = resp.json().get("id")
+                logger.info(f"QR code uploaded to WhatsApp: media_id={media_id}")
+                return media_id
+            logger.error(f"QR code upload failed ({resp.status_code}): {resp.text}")
+            return None
+    except Exception as e:
+        logger.error(f"QR code upload error: {e}")
+        return None
+
+
+async def _startup_upload_qr_code():
+    """Upload the QR code on startup and cache the media_id."""
+    global _qr_code_media_id
+    media_id = await _upload_qr_code_to_whatsapp()
+    if media_id:
+        _qr_code_media_id = media_id
+        logger.info(f"QR code ready (startup): media_id={_qr_code_media_id}")
+    else:
+        logger.warning("QR code upload failed at startup — will retry on first use or fall back to URL")
+
+
+async def _send_qr_code(phone: str) -> bool:
+    """Send the factory QR code image to a customer. Returns True on success."""
+    global _qr_code_media_id
+    caption = "💳 Scan this QR code to make your payment"
+
+    async def _try_send_by_id(mid: str) -> bool:
+        ok = await send_whatsapp_image_media_id(phone, mid, caption)
+        if ok:
+            log_message(phone, "bot", caption, msg_type="image",
+                        media_url=f"media:{mid}", caption=caption,
+                        media_name="Factory_QR_CODE.png")
+        return ok
+
+    # Try cached media_id
+    if _qr_code_media_id:
+        if await _try_send_by_id(_qr_code_media_id):
+            return True
+        logger.warning("QR media_id send failed — re-uploading")
+        _qr_code_media_id = None
+
+    # Re-upload and retry
+    new_id = await _upload_qr_code_to_whatsapp()
+    if new_id:
+        _qr_code_media_id = new_id
+        if await _try_send_by_id(new_id):
+            return True
+
+    # Final fallback: public URL from env var
+    fallback_url = os.environ.get("QR_CODE_IMAGE_URL", "")
+    if fallback_url:
+        ok = await send_whatsapp_image_url(phone, fallback_url, caption)
+        if ok:
+            log_message(phone, "bot", caption, msg_type="image",
+                        media_url=fallback_url, caption=caption,
+                        media_name="Factory_QR_CODE.png")
+            return True
+
+    logger.error(f"All QR code delivery methods failed for {phone}")
+    return False
+
+
+def _get_net_banking_link() -> str:
+    """Read the net banking link from media/NET_BANKING.txt."""
+    nb_path = Path(__file__).parent.parent / "media" / "NET_BANKING.txt"
+    try:
+        return nb_path.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        logger.error(f"Failed to read NET_BANKING.txt: {e}")
+        return "Please contact us for net banking details."
+
+
+def _parse_payment_choice(text: str) -> Optional[int]:
+    """Map free-form customer text to a payment option (1–4), or None if unclear."""
+    t = text.strip().lower()
+    # Exact number / "option N" matches
+    if t in {"1", "1.", "option 1", "option1"}:
+        return 1
+    if t in {"2", "2.", "option 2", "option2"}:
+        return 2
+    if t in {"3", "3.", "option 3", "option3"}:
+        return 3
+    if t in {"4", "4.", "option 4", "option4"}:
+        return 4
+    # Keyword matching — option 1 (QR code)
+    if any(kw in t for kw in ("qr", "scan", "qr code")):
+        return 1
+    # Keyword matching — option 2 (net banking)
+    if any(kw in t for kw in ("net banking", "netbanking", "net bank", "bank transfer", "neft", "imps", "upi")):
+        return 2
+    # Keyword matching — option 3 (other way)
+    if any(kw in t for kw in ("other way", "other method", "other option", "different way", "different method")):
+        return 3
+    if t in {"other", "others"}:
+        return 3
+    # Keyword matching — option 4 (talk to factory)
+    if any(kw in t for kw in ("talk to factory", "connect to factory", "speak to factory",
+                               "talk to team", "connect me", "speak with", "talk to someone")):
+        return 4
+    if t in {"talk", "factory", "connect", "speak"}:
+        return 4
+    return None
+
+
+def _add_dashboard_alert(phone: str, message: str):
+    """Append a notification alert to the dashboard alert queue."""
+    import uuid
+    now = datetime.now(timezone.utc)
+    # Prune alerts older than 24 hours
+    cutoff = now - timedelta(hours=24)
+    dashboard_alerts[:] = [
+        a for a in dashboard_alerts
+        if datetime.fromisoformat(a["timestamp"]) > cutoff
+    ]
+    dashboard_alerts.append({
+        "id": uuid.uuid4().hex,
+        "phone": phone,
+        "message": message,
+        "timestamp": now.isoformat(),
+        "dismissed": False,
+    })
+    logger.info(f"[ALERT] {phone}: {message}")
 
 
 # ---------------------------------------------------------------------------
@@ -876,22 +1246,24 @@ async def handle_factory_reply(text: str):
     next_steps_idx = raw_summary.upper().find('NEXT STEPS')
     clean_summary = raw_summary[:next_steps_idx].rstrip() if next_steps_idx != -1 else raw_summary
 
-    # Mark the order as awaiting customer confirmation and store the price text
-    # so the confirm/no handlers can include it in the factory notification.
+    # Mark the order as awaiting the customer's payment method choice.
     pending_orders[order_id]['price_text'] = price_text
-    pending_orders[order_id]['awaiting_confirmation'] = True
+    pending_orders[order_id]['awaiting_payment_choice'] = True
 
     # Use **markdown bold** (not WhatsApp *bold*) so:
     #   • marked.js in the dashboard renders it as bold HTML
     #   • markdown_to_whatsapp() inside send_and_log converts ** → * before sending to WhatsApp
     pricing_message = (
-        "💰 Pricing Update from Kalash Packaging!\n\n"
+        "💰 Pricing Update from Kavacch!\n\n"
         f"{clean_summary}\n\n"
-        "**📋 Price Quote & Estimated Delivery Time:**\n"
+        "**📋 Price Quote & Estimated Delivery:**\n"
         f"**{price_text}**\n\n"
-        "Reply 'confirm' to proceed with the order or \"No\" to not confirm order"
-        " or you can ask any questions.\n\n"
-        "Thank you for choosing Kalash Packaging! 🙏"
+        "Please choose your payment method:\n\n"
+        "1️⃣ Pay using QR code\n"
+        "2️⃣ Pay using net banking\n"
+        "3️⃣ Pay using other way\n"
+        "4️⃣ Talk to factory\n\n"
+        "Reply *1*, *2*, *3*, or *4* to choose your option."
     )
 
     await send_and_log(customer_phone, pricing_message)
@@ -924,83 +1296,114 @@ async def handle_customer_message(phone: str, text: str, msg_id: str = ""):
         await send_and_log(phone, "\U0001f504 Your session has been reset! You can start a fresh conversation now.")
         return
 
-    # Order confirmation
-    if stripped == "confirm":
-        # Find the most-recent pending order for this phone that is awaiting confirmation
-        awaiting = [
-            (oid, data) for oid, data in pending_orders.items()
-            if data.get("customer_phone") == phone and data.get("awaiting_confirmation")
-        ]
-        if awaiting:
-            order_id_conf, order_data_conf = max(awaiting, key=lambda x: x[1]["timestamp"])
-            products_conf = order_data_conf.get("products", [])
-            if products_conf:
-                cart_lines = "\n".join(
-                    f"  {i}. {p['product_type']}: {p['product_name']} x {p['quantity']}"
-                    for i, p in enumerate(products_conf, 1)
-                )
-            else:
-                cart_lines = f"  {order_data_conf.get('order_summary', 'N/A')}"
-            factory_confirm_msg = (
-                f"✅ Order #{order_id_conf} CONFIRMED\n"
-                f"👤 {order_data_conf.get('customer_name', 'Customer')} ({phone})\n\n"
-                f"Items:\n{cart_lines}\n\n"
-                f"Price Quote: {order_data_conf.get('price_text', 'N/A')}"
-            )
-            await send_whatsapp(FACTORY_WHATSAPP, factory_confirm_msg)
-            remove_pending_order(order_id_conf)
-
+    # --- Payment method description follow-up (option 3: "other way") ---
+    _awaiting_desc = [
+        (oid, data) for oid, data in pending_orders.items()
+        if data.get("customer_phone") == phone and data.get("awaiting_payment_method_description")
+    ]
+    if _awaiting_desc:
+        order_id_desc, order_data_desc = max(_awaiting_desc, key=lambda x: x[1]["timestamp"])
+        payment_method = text.strip()
+        await send_whatsapp(
+            FACTORY_WHATSAPP,
+            f"💬 Customer {phone} chose *Other Payment Method*\n"
+            f"Method: {payment_method}\n"
+            f"Order #{order_id_desc} — {order_data_desc.get('customer_name', 'Customer')}"
+        )
+        set_control_state(phone, "HUMAN_CONTROL")
+        _add_dashboard_alert(
+            phone,
+            f"🔔 Customer chose custom payment: \"{payment_method}\" — takeover enabled for {phone} (order #{order_id_desc})"
+        )
+        log_message(phone, "bot", f"🔔 Customer connected to factory (payment: {payment_method})", msg_type="notification")
+        pending_orders[order_id_desc]["awaiting_payment_method_description"] = False
+        remove_pending_order(order_id_desc)
         await send_and_log(
             phone,
-            "✅ Your order is confirmed\n\n"
-            "NEXT STEPS:\n\n"
-            "Thank you for your interest in Kalash Packaging! 🎉\n\n"
-            "Our team will contact you shortly with:\n"
-            "• Detailed pricing for your order\n"
-            "• Available customization options\n"
-            "• Delivery timeline\n"
-            "• Any additional information you may need\n\n"
-            "Contact Information:\n"
-            "📞 9106845371\n"
-            "📞 7600337948\n\n"
-            "We look forward to serving you!\n\n"
-            "Kalash Packaging Team"
+            "Thank you! We've noted your payment preference and connected you with our team. "
+            "They'll assist you shortly! 🙏"
         )
         return
 
-    # Order denial — only intercept when there is an order awaiting confirmation
-    _denial_phrases = {"no", "nope", "cancel", "dont confirm", "don't confirm"}
-    if stripped in _denial_phrases or stripped.startswith("no "):
-        awaiting_den = [
-            (oid, data) for oid, data in pending_orders.items()
-            if data.get("customer_phone") == phone and data.get("awaiting_confirmation")
-        ]
-        if awaiting_den:
-            order_id_den, order_data_den = max(awaiting_den, key=lambda x: x[1]["timestamp"])
-            products_den = order_data_den.get("products", [])
-            if products_den:
-                cart_lines_den = "\n".join(
-                    f"  {i}. {p['product_type']}: {p['product_name']} x {p['quantity']}"
-                    for i, p in enumerate(products_den, 1)
-                )
-            else:
-                cart_lines_den = f"  {order_data_den.get('order_summary', 'N/A')}"
-            factory_denial_msg = (
-                f"❌ Order #{order_id_den} NOT CONFIRMED\n"
-                f"👤 {order_data_den.get('customer_name', 'Customer')} ({phone})\n\n"
-                f"Items:\n{cart_lines_den}\n\n"
-                f"Price Quote: {order_data_den.get('price_text', 'N/A')}"
-            )
-            await send_whatsapp(FACTORY_WHATSAPP, factory_denial_msg)
-            remove_pending_order(order_id_den)
+    # --- Payment method choice (options 1–4) ---
+    _awaiting_choice = [
+        (oid, data) for oid, data in pending_orders.items()
+        if data.get("customer_phone") == phone and data.get("awaiting_payment_choice")
+    ]
+    if _awaiting_choice:
+        order_id_pay, order_data_pay = max(_awaiting_choice, key=lambda x: x[1]["timestamp"])
+        choice = _parse_payment_choice(stripped)
+
+        if choice == 1:
+            pending_orders[order_id_pay]["awaiting_payment_choice"] = False
+            pending_orders[order_id_pay]["awaiting_payment_screenshot"] = True
+            await _send_qr_code(phone)
             await send_and_log(
                 phone,
-                "No problem! Your order has not been placed. 😊\n\n"
-                "Feel free to browse our products or start a new order anytime.\n\n"
-                "Thank you for considering Kalash Packaging!"
+                "💳 Here's the QR code above!\n\n"
+                "Please complete the payment and send us a *screenshot* once done. 📸"
             )
-            return
-        # No awaiting order found — fall through to the agent so "no" works naturally in chat
+
+        elif choice == 2:
+            link = _get_net_banking_link()
+            pending_orders[order_id_pay]["awaiting_payment_choice"] = False
+            pending_orders[order_id_pay]["awaiting_payment_screenshot"] = True
+            await send_and_log(
+                phone,
+                f"🏦 *Net Banking Payment Link:*\n{link}\n\n"
+                "Please complete the payment and send us a *screenshot* once done. 📸"
+            )
+
+        elif choice == 3:
+            pending_orders[order_id_pay]["awaiting_payment_choice"] = False
+            pending_orders[order_id_pay]["awaiting_payment_method_description"] = True
+            await send_and_log(phone, "Sure! Can you tell me which payment method you'd like to use? 💬")
+
+        elif choice == 4:
+            set_control_state(phone, "HUMAN_CONTROL")
+            _add_dashboard_alert(
+                phone,
+                f"🔔 Customer {phone} wants to talk to factory directly (order #{order_id_pay}). Takeover enabled."
+            )
+            await send_whatsapp(
+                FACTORY_WHATSAPP,
+                f"🔔 Customer {phone} wants to talk to factory directly\n"
+                f"Order #{order_id_pay} — {order_data_pay.get('customer_name', 'Customer')}\n"
+                f"Price quote: {order_data_pay.get('price_text', 'N/A')}"
+            )
+            log_message(phone, "bot", "🔔 Customer requested factory connection. Takeover enabled.", msg_type="notification")
+            remove_pending_order(order_id_pay)
+            await send_and_log(
+                phone,
+                "Connecting you with our factory team now! They'll be with you shortly. 🙏"
+            )
+
+        elif stripped in {"cancel", "no", "nope"}:
+            await send_whatsapp(
+                FACTORY_WHATSAPP,
+                f"❌ Order #{order_id_pay} — customer cancelled payment\n"
+                f"👤 {order_data_pay.get('customer_name', 'Customer')} ({phone})"
+            )
+            remove_pending_order(order_id_pay)
+            await send_and_log(
+                phone,
+                "No problem! Your order has been cancelled. Feel free to start a new order anytime. 😊\n\n"
+                "Thank you for considering Kavacch!"
+            )
+
+        else:
+            # Unrecognized input — repeat the menu
+            await send_and_log(
+                phone,
+                "Please choose one of the options:\n\n"
+                "1️⃣ Pay using QR code\n"
+                "2️⃣ Pay using net banking\n"
+                "3️⃣ Pay using other way\n"
+                "4️⃣ Talk to factory\n\n"
+                "Reply *1*, *2*, *3*, or *4*."
+            )
+
+        return  # always return — never fall through to agent while in payment state
 
     # Typing indicator — sent before acquiring the lock so the user sees
     # immediate read-receipt feedback even if a prior message is still processing.
@@ -1127,10 +1530,32 @@ async def webhook(request: Request):
                             media_name=media_name or None,
                         )
                         if get_control_state(phone) != "HUMAN_CONTROL":
-                            await send_and_log(
-                                phone,
-                                "I received your image! For the best help, please describe your question in text and I\u2019ll assist you right away. \U0001f60a"
-                            )
+                            # Check if customer was asked to send a payment screenshot
+                            _screenshot_orders = [
+                                (oid, data) for oid, data in pending_orders.items()
+                                if data.get("customer_phone") == phone
+                                and data.get("awaiting_payment_screenshot")
+                            ]
+                            if _screenshot_orders:
+                                oid_ss, data_ss = max(_screenshot_orders, key=lambda x: x[1]["timestamp"])
+                                await send_whatsapp(
+                                    FACTORY_WHATSAPP,
+                                    f"📸 Customer {phone} sent payment screenshot\n"
+                                    f"Order #{oid_ss} — {data_ss.get('customer_name', 'Customer')}\n"
+                                    f"Price quote: {data_ss.get('price_text', 'N/A')}"
+                                )
+                                pending_orders[oid_ss]["awaiting_payment_screenshot"] = False
+                                remove_pending_order(oid_ss)
+                                await send_and_log(
+                                    phone,
+                                    "✅ Thank you! We've received your payment screenshot and will confirm shortly. 🙏\n\n"
+                                    "Thank you for choosing Kavacch!"
+                                )
+                            else:
+                                await send_and_log(
+                                    phone,
+                                    "I received your image! For the best help, please describe your question in text and I\u2019ll assist you right away. \U0001f60a"
+                                )
                         
     except Exception as e:
         logger.error(f"Webhook processing error: {e}")
@@ -1222,18 +1647,30 @@ async def dashboard():
 @app.get("/api/conversations")
 async def api_get_conversations():
     """List all conversations with metadata."""
+    blocked_users = await get_blocked_users()
     result = {}
     for phone, messages in conversation_logs.items():
         last_msg = messages[-1] if messages else None
-        awaiting = any(
-            d.get("customer_phone") == phone and d.get("awaiting_confirmation")
+        awaiting_payment_choice = any(
+            d.get("customer_phone") == phone and d.get("awaiting_payment_choice")
+            for d in pending_orders.values()
+        )
+        awaiting_method_desc = any(
+            d.get("customer_phone") == phone and d.get("awaiting_payment_method_description")
+            for d in pending_orders.values()
+        )
+        awaiting_screenshot = any(
+            d.get("customer_phone") == phone and d.get("awaiting_payment_screenshot")
             for d in pending_orders.values()
         )
         result[phone] = {
             "state": get_control_state(phone),
+            "blocked": phone in blocked_users,
             "message_count": len(messages),
             "last_message": last_msg,
-            "awaiting_confirmation": awaiting,
+            "awaiting_payment_choice": awaiting_payment_choice,
+            "awaiting_payment_method_description": awaiting_method_desc,
+            "awaiting_payment_screenshot": awaiting_screenshot,
         }
     return result
 
@@ -1256,16 +1693,59 @@ async def api_get_resolutions():
 @app.get("/api/conversations/{phone}")
 async def api_get_conversation(phone: str):
     """Get full transcript for a customer."""
+    blocked_users = await get_blocked_users()
     return {
         "phone": phone,
         "state": get_control_state(phone),
+        "blocked": phone in blocked_users,
         "messages": conversation_logs.get(phone, [])
     }
+
+
+@app.post("/api/block/{phone}")
+async def api_block_number(phone: str):
+    """Block a customer via the official WhatsApp Cloud API."""
+    try:
+        result = await set_blocked_user(phone, True)
+        if get_control_state(phone) == "HUMAN_CONTROL":
+            set_control_state(phone, "BOT_CONTROL")
+        logger.info(f"[BLOCK] {phone} blocked via WhatsApp Cloud API")
+        return result
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text
+        logger.error(f"Block API rejected request for {phone}: {detail}")
+        return JSONResponse({"error": detail or "Block request failed"}, status_code=exc.response.status_code)
+    except Exception as exc:
+        logger.error(f"Block request failed for {phone}: {exc}")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/unblock/{phone}")
+async def api_unblock_number(phone: str):
+    """Unblock a customer via the official WhatsApp Cloud API."""
+    try:
+        result = await set_blocked_user(phone, False)
+        logger.info(f"[UNBLOCK] {phone} unblocked via WhatsApp Cloud API")
+        return result
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text
+        logger.error(f"Unblock API rejected request for {phone}: {detail}")
+        return JSONResponse({"error": detail or "Unblock request failed"}, status_code=exc.response.status_code)
+    except Exception as exc:
+        logger.error(f"Unblock request failed for {phone}: {exc}")
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.post("/api/toggle/{phone}")
 async def api_toggle_control(phone: str):
     """Toggle BOT_CONTROL \u21d4 HUMAN_CONTROL for a conversation."""
+    blocked_users = await get_blocked_users()
+    if phone in blocked_users:
+        return JSONResponse(
+            {"error": "Conversation is blocked on WhatsApp. Unblock it first."},
+            status_code=400,
+        )
+
     current = get_control_state(phone)
     new_state = "HUMAN_CONTROL" if current == "BOT_CONTROL" else "BOT_CONTROL"
     set_control_state(phone, new_state)
@@ -1334,7 +1814,7 @@ async def api_media_upload(file: UploadFile = File(...)):
             status_code=400,
         )
 
-    upload_url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/media"
+    upload_url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/media"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     try:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -1384,7 +1864,7 @@ async def api_media_upload_pdf(file: UploadFile = File(...)):
             status_code=400,
         )
 
-    upload_url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/media"
+    upload_url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/media"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     safe_filename = file.filename or "document.pdf"
     try:
@@ -1505,6 +1985,34 @@ async def api_media_proxy(media_id: str):
     except Exception as e:
         logger.error(f"Media proxy error for {media_id}: {e}")
         return JSONResponse({"error": "Media proxy error"}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard Alert Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/dashboard_alerts")
+async def api_get_dashboard_alerts():
+    """Return non-dismissed dashboard alerts (newest first, last 24h)."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    active = [
+        a for a in dashboard_alerts
+        if not a["dismissed"]
+        and datetime.fromisoformat(a["timestamp"]) > cutoff
+    ]
+    active.sort(key=lambda a: a["timestamp"], reverse=True)
+    return {"alerts": active}
+
+
+@app.post("/api/dashboard_alerts/{alert_id}/dismiss")
+async def api_dismiss_dashboard_alert(alert_id: str):
+    """Mark a dashboard alert as dismissed."""
+    for alert in dashboard_alerts:
+        if alert["id"] == alert_id:
+            alert["dismissed"] = True
+            return {"status": "dismissed"}
+    return JSONResponse({"error": "Alert not found"}, status_code=404)
 
 
 # ---------------------------------------------------------------------------

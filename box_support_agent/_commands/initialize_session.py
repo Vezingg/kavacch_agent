@@ -46,7 +46,7 @@ class ResponseGenerator:
         # Initialize the root command context
         workflow.root_command_context = SupportSession(command_parameters.customer_phone)
 
-        response = f"""**Welcome to Kalash Packaging!** 👋
+        response = f"""**Welcome to Kavacch!** 👋
 
 I'm your customer support assistant. I'm here to help you with all your packaging needs.
 

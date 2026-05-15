@@ -79,7 +79,7 @@ class SupportSession:
         summary += f"**Total Quantity:** {sum(item.quantity for item in self.cart)}\n\n"
 
         summary += "**NEXT STEPS:**\n\n"
-        summary += "Thank you for your interest in Kalash Packaging! 🎉\n\n"
+        summary += "Thank you for your interest in Kavacch! 🎉\n\n"
         summary += "Our team will contact you shortly with:\n"
         summary += "   • Detailed pricing for your order\n"
         summary += "   • Available customization options\n"
@@ -89,7 +89,7 @@ class SupportSession:
         summary += "   📞 9106845371\n"
         summary += "   📞 7600337948\n\n"
         summary += "We look forward to serving you!\n"
-        summary += "- Kalash Packaging Team"
+        summary += "- Kavacch Team"
 
         return summary
 

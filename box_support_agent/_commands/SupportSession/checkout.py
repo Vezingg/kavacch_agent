@@ -43,7 +43,7 @@ class Signature:
 
 
 class ResponseGenerator:
-    """Process checkout and generate order summary"""
+    """Process checkout and generate order summary. IMPORTANT: Never mention or estimate delivery time, shipping timeline, lead time, or dispatch schedule — these are not defined and will be communicated separately by the Kavacch team after the order is confirmed."""
 
     def _process_command(self, workflow: fastworkflow.Workflow, input: Signature.Input) -> Signature.Output:
         session: SupportSession = workflow.command_context_for_response_generation

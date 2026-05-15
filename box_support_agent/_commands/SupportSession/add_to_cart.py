@@ -13,12 +13,12 @@ class Signature:
 
     class Input(BaseModel):
         product_type: str = Field(
-            description="Type of product (Window Box, MDF Board, Drum Board, or Cutlery Kit)",
-            examples=['Window Box', 'MDF Board', 'Drum Board', 'Cutlery Kit'],
+            description="Type of product (Window Box, MDF Board / Cake Base / Cake Board, Drum Board, Cutlery Kit, Gift Box, or Tray Box)",
+            examples=['Window Box', 'MDF Board', 'Cake Base', 'Cake Board', 'Drum Board', 'Cutlery Kit', 'Gift Box', 'Tray Box'],
         )
         product_name: str = Field(
             description="Specific product name/size/specification",
-            examples=['8x8x5 Top Window', '10x10x5 L Window', '12 inch Black MDF', '10x10 White Drum Board', 'Standard Cutlery Kit'],
+            examples=['8x8x5 Top Window', '10x10x5 L Window', '12 inch Black MDF', '10x10 White Drum Board', 'Standard Cutlery Kit', 'SA 001 Blue Mughal Arch-Top', 'SA 014 Hut', 'SA 0020 2-Jar MGI Golden Work', 'Tray Box with Handle 9 inch Peach', 'Tray Box without Handle 11 inch Pink'],
         )
         quantity: Optional[int] = Field(
             description="Quantity to order - REQUIRED field. If customer doesn't specify quantity, ASK them for it. Do not assume a default quantity.",
@@ -39,6 +39,9 @@ class Signature:
     plain_utterances = [
         "I want to order 100 window boxes 8x8x5",
         "add 500 MDF boards 12 inch black to my cart",
+        "I need 200 cake bases 10 inch golden",
+        "add cake boards 12 inch to my cart",
+        "order 100 base boards 8 inch white",
         "I need 1000 cutlery kits with custom branding",
         "add to cart 200 drum boards 10x10 white",
         "I'd like 300 top window boxes 10x10x5 in pastel colors",
@@ -47,6 +50,14 @@ class Signature:
         "add MDF boards to cart",
         "I need some cutlery kits",
         "can I order drum boards 10x10",
+        "add 100 gift boxes SA 001 blue to my cart",
+        "I want to order SA 014 hut shaped gift boxes",
+        "add 50 SA 0020 2 jar MGI golden work gift boxes",
+        "order 200 tray boxes with handle 9 inch",
+        "I need tray boxes without handle in pink",
+        "add SA 016 flower gift boxes to cart",
+        "I want 150 SA 0022 3 jar boxes with MGI golden work",
+        "order tray boxes 11 inch purple",
     ]
 
     @staticmethod

@@ -37,11 +37,20 @@ class ResponseGenerator:
     ) -> fastworkflow.CommandOutput:
         response = """Here's what I can help you with:
 
-📦 *Product Info* — Ask about window boxes, MDF boards, drum boards, or cutlery kits
-📏 *Sizes* — "What sizes are available?"
-🎨 *Colors* — "What colors do you have?"
+📦 *Product Info* — Ask about any of our products:
+   • Window Boxes (Top Window & L Window, 8×8×5 to 12×12×8)
+   • MDF Boards / Cake Bases (6" to 20", Square/Round/Round with Handle)
+   • Drum Boards (10×10, 12×12, 14×14)
+   • Cutlery Kits (knife + candles, custom branding available)
+   • Gift Boxes — Festival Edition (33 variants across 17 design groups:
+     Mughal Arch-Top, Floral Dome-Top, House Window, Landscape Bags,
+     Hut/3-D shapes, Jar Boxes with MGI Golden Work, and more)
+   • Tray Boxes (9" with handle in 3 colors / 11" without handle in 2 colors)
+
+📏 *Sizes* — "What sizes are available for gift boxes?"
+🎨 *Colors* — "What colors does SA 001 come in?"
 ✨ *Customization* — "Do you offer branding or foil stamping?"
-🛒 *Add to Cart* — "Add 500 window boxes to my cart"
+🛒 *Add to Cart* — "Add 100 SA 014 hut gift boxes" / "Add 200 tray boxes with handle"
 👁 *View Cart* — "Show me my cart"
 🗑 *Remove Item* — "Remove item 2 from my cart"
 ❌ *Clear Cart* — "Clear my cart"
