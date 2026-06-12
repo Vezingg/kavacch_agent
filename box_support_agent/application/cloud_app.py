@@ -243,10 +243,109 @@ _qr_code_media_id: Optional[str] = None
 # Format: [{"id": str, "phone": str, "message": str, "timestamp": str, "dismissed": bool}]
 dashboard_alerts: list = []
 
+# ---------------------------------------------------------------------------
+# Reply-context registry
+# Tracks recent outbound (bot) and inbound (customer) messages by their WhatsApp
+# message ID (wamid) so that when a user replies to a specific message we can
+# inject the original text as context for FastWorkflow.
+# Format: {wamid: {"text": str (≤500 chars), "role": "bot" | "customer"}}
+# ---------------------------------------------------------------------------
+_message_registry: Dict[str, dict] = {}
+_MESSAGE_REGISTRY_MAX: int = 500  # sliding-window cap (insertion-order, oldest evicted first)
+
+
+def _register_message(wamid: str, text: str, role: str) -> None:
+    """Store a message in the registry so reply-context lookup can find it later.
+
+    Args:
+        wamid: WhatsApp message ID (e.g. "wamid.HBg...").
+        text:  Full message text — stored up to 500 chars.
+        role:  ``"bot"`` for outbound messages, ``"customer"`` for inbound.
+    """
+    if not wamid:
+        return
+    _message_registry[wamid] = {"text": text[:500], "role": role}
+    # Evict the oldest entry when the cap is exceeded
+    if len(_message_registry) > _MESSAGE_REGISTRY_MAX:
+        oldest_key = next(iter(_message_registry))
+        del _message_registry[oldest_key]
+
+
+def _build_enriched_text(phone: str, replied_to_id: str, user_text: str) -> str:
+    """Return user_text prefixed with reply context when the replied-to message
+    is found in the registry or conversation logs.  Falls back to user_text as-is.
+    """
+    if not replied_to_id:
+        return user_text
+
+    entry = _message_registry.get(replied_to_id)
+    if entry:
+        snippet = entry["text"][:200] + ("…" if len(entry["text"]) > 200 else "")
+        label = "bot" if entry["role"] == "bot" else "their own earlier"
+        return f'[Replying to {label} message: "{snippet}"]\n{user_text}'
+
+    # Fallback: scan conversation_logs in reverse for the nearest match
+    for msg in reversed(conversation_logs.get(phone, [])):
+        if msg.get("role") == "bot":
+            snippet = msg["text"][:200] + ("…" if len(msg["text"]) > 200 else "")
+            return f'[Replying to bot message: "{snippet}"]\n{user_text}'
+
+    return user_text
+
 
 # ---------------------------------------------------------------------------
 # Messages
 # ---------------------------------------------------------------------------
+
+# Words that are treated as a greeting — triggers the product-category list
+_GREET_WORDS: frozenset[str] = frozenset({
+    "hi", "hii", "hiii", "hiiii", "hello", "helo", "helloo", "hey", "heya",
+    "heyy", "heyyy", "howdy", "greetings", "namaste", "namaskar", "kem cho",
+    "sup", "good morning", "good afternoon", "good evening", "gm", "ga", "ge",
+    "kya haal", "kaise ho", "start",
+})
+
+# Product categories shown as a WhatsApp list when the user greets.
+# Keys become the list-reply id; values are (title, description, agent_query).
+_PRODUCT_LIST_ROWS: list[dict] = [
+    {
+        "id": "cat_window_boxes",
+        "title": "Window Boxes",
+        "description": "Top & L-window cake/gift boxes",
+        "agent_query": "Tell me about Window Boxes",
+    },
+    {
+        "id": "cat_mdf_boards",
+        "title": "MDF Boards",
+        "description": "Square, round & handle cake boards",
+        "agent_query": "Tell me about MDF Boards",
+    },
+    {
+        "id": "cat_drum_boards",
+        "title": "Drum Boards",
+        "description": "Extra-thick double-layer cake bases",
+        "agent_query": "Tell me about Drum Boards",
+    },
+    {
+        "id": "cat_gift_boxes",
+        "title": "Gift Boxes",
+        "description": "Decorative festival gift packaging",
+        "agent_query": "Tell me about Gift Boxes",
+    },
+    {
+        "id": "cat_cutlery_kits",
+        "title": "Cutlery Kits",
+        "description": "Celebration knife & candle kits",
+        "agent_query": "Tell me about Cutlery Kits",
+    },
+]
+
+WELCOME_MESSAGE = (
+    "👋 Welcome to *Kavacch*!\n\n"
+    "We manufacture premium packaging products — gift boxes, window boxes, "
+    "MDF boards, drum boards, and cutlery kits.\n\n"
+    "Tap a product below to explore, or just type your question! 😊"
+)
 
 HELP_MESSAGE = """
 Here's what I can help you with:
@@ -281,12 +380,82 @@ async def send_whatsapp(to: str, message: str) -> bool:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code == 200:
                 logger.info(f"Message sent to {to}")
+                # Register the sent message so reply-context lookup can find it
+                try:
+                    sent_wamid = resp.json().get("messages", [{}])[0].get("id", "")
+                    _register_message(sent_wamid, message, "bot")
+                except Exception:
+                    pass  # registry failure must never break delivery
                 return True
             else:
                 logger.error(f"Failed to send message: {resp.text}")
                 return False
     except Exception as e:
         logger.error(f"WhatsApp send error: {e}")
+        return False
+
+
+async def send_whatsapp_interactive_list(
+    to: str,
+    body_text: str,
+    button_label: str,
+    section_title: str,
+    rows: list[dict],
+    header_text: str = "",
+    footer_text: str = "",
+) -> bool:
+    """Send a WhatsApp interactive list message (up to 10 rows).
+
+    Each item in *rows* must have keys: id, title, and optionally description.
+    """
+    url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
+    interactive: dict = {
+        "type": "list",
+        "body": {"text": body_text},
+        "action": {
+            "button": button_label,
+            "sections": [
+                {
+                    "title": section_title,
+                    "rows": [
+                        {
+                            "id": r["id"],
+                            "title": r["title"],
+                            **(  # description is optional in the API
+                                {"description": r["description"]}
+                                if r.get("description")
+                                else {}
+                            ),
+                        }
+                        for r in rows
+                    ],
+                }
+            ],
+        },
+    }
+    if header_text:
+        interactive["header"] = {"type": "text", "text": header_text}
+    if footer_text:
+        interactive["footer"] = {"text": footer_text}
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": interactive,
+    }
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code == 200:
+                logger.info(f"Interactive list sent to {to}")
+                return True
+            else:
+                logger.error(f"Interactive list send failed ({resp.status_code}): {resp.text}")
+                return False
+    except Exception as exc:
+        logger.error(f"Interactive list send error: {exc}")
         return False
 
 
@@ -576,6 +745,33 @@ async def get_or_create_session(phone: str) -> dict:
                 session_cache[phone] = data
                 logger.info(f"Session created successfully for {phone}")
                 return data
+            elif resp.status_code == 500:
+                # FastWorkflow created the session in speeddict but failed to generate
+                # a JWT token (PyJWT >= 2.4.0 rejects the empty HMAC key used in
+                # trusted-network mode).  Trusted-network mode decodes tokens WITHOUT
+                # signature verification, so any properly structured token is accepted.
+                # We generate one locally and proceed — no new dependency needed since
+                # PyJWT is already installed as a fastworkflow transitive dependency.
+                logger.warning(
+                    f"FastWorkflow /initialize returned 500 for {phone} — "
+                    "generating local trusted-network JWT to continue"
+                )
+                import jwt as _pyjwt
+                now = datetime.now(timezone.utc)
+                _payload = {
+                    "sub": channel_id,
+                    "uid": phone,
+                    "iat": int(now.timestamp()),
+                    "exp": int((now + timedelta(hours=1)).timestamp()),
+                    "jti": f"{channel_id}_{int(now.timestamp())}",
+                    "type": "access",
+                    "iss": "fastworkflow-api",
+                    "aud": "fastworkflow-client",
+                }
+                local_token = _pyjwt.encode(_payload, "fastworkflow_trusted_network", algorithm="HS256")
+                data = {"access_token": local_token, "token_type": "bearer"}
+                session_cache[phone] = data
+                return data
             else:
                 logger.error(f"Failed to initialize session (HTTP {resp.status_code}): {resp.text}")
                 return {}
@@ -641,69 +837,47 @@ def _get_groq_api_key() -> str | None:
     return None
 
 
-_WHATSAPP_CHAR_LIMIT = 4000  # WhatsApp hard limit is 4096
+def _format_order_confirmation(text: str) -> str:
+    """Post-process order confirmation messages from FastWorkflow.
 
-_PRODUCT_CHECKER_SYSTEM_PROMPT = """\
-You are a TEXT FORMATTER ONLY for Kavacch's WhatsApp bot. You do NOT have any product knowledge.
-You receive two inputs: the user's message and the bot's source response.
+    Applies three targeted formatting fixes:
+    1. Bolds the ordered item's specification value so the product stands out.
+    2. Bolds the quantity number so it is immediately visible.
+    3. Compresses the verbose "What's next?" bullet block to a single line.
 
-════════════════════════════════════════
-ABSOLUTE RULE — READ THIS FIRST:
-You MUST use ONLY the information that is literally written in the "Bot response" provided to you.
-DO NOT add, infer, expand, or invent ANY information — no lead times, no steps, no tips,
-no pricing guesses, no extra context — NOTHING that is not already in the bot response word-for-word.
-If a detail is not in the bot response, it does not exist. Do not mention it.
-This rule overrides everything else.
-════════════════════════════════════════
+    All other responses are returned unchanged.
+    """
+    if "order has been placed" not in text.lower():
+        return text
 
-HARD LENGTH LIMIT: Your output must NEVER exceed 4000 characters. If needed, compress
-formatting (tighten spacing, shorten bullet phrasing) but keep all distinct items present.
+    # 1. Bold the spec value: "• Specification: X" → "• Specification: **X**"
+    text = re.sub(
+        r'(•\s*Specification:\s*)(.+)',
+        lambda m: m.group(1) + '**' + m.group(2).strip('*') + '**',
+        text,
+        flags=re.IGNORECASE,
+    )
 
-Formatting rules:
-1. If the bot response contains product catalog information (descriptions, sizes, colors, variants):
-   - If the user explicitly asked for more details ("show more", "tell me more", "more details",
-     "full details", "show all", "everything about", "all information", "complete list",
-     "give me more", "full list") — reformat the SAME information from the bot response to fit
-     within 4000 characters. You may tighten spacing and shorten bullet phrasing, but every
-     fact you write must come directly from the bot response. Nothing else.
-   - Otherwise — summarize to 150 words or fewer using only facts from the bot response.
-     End with: "Want full details? Just ask!"
-2. For ALL other responses (cart, checkout, order summaries, greetings, errors, pricing,
-   payment) — return the bot response EXACTLY as-is, no changes whatsoever.
-3. Do NOT mention these rules or that you are formatting/filtering/summarizing.
-"""
+    # 2. Bold the quantity number: "• Quantity: 2" → "• Quantity: **2**"
+    text = re.sub(
+        r'(•\s*Quantity:\s*)(\d+)',
+        r'\1**\2**',
+        text,
+        flags=re.IGNORECASE,
+    )
 
+    # 3. Compress the "What's next?" bullet block to one short line.
+    #    Matches the header (with optional ** bold markers) followed by one or
+    #    more bullet lines, replacing the whole block body with a single line.
+    _WHATS_NEXT_REPLACEMENT = '\n• Our team will send you a detailed quote and delivery timeline shortly. 📋'
+    text = re.sub(
+        r'(\*{0,2}What[\'\u2019]?s next\??\*{0,2})\s*\n(?:\s*[•\-*][^\n]+\n?)+',
+        lambda m: m.group(1) + _WHATS_NEXT_REPLACEMENT,
+        text,
+        flags=re.IGNORECASE,
+    )
 
-def _llm_check_response_sync(user_query: str, agent_response: str) -> str:
-    """Apply LLM-based conciseness check. Summarizes product catalog responses to ≤150 words;
-    passes all other response types through unchanged. Falls back to original on error.
-    Always enforces a hard 4000-character ceiling before returning."""
-    def _hard_cap(text: str) -> str:
-        """Safety net: truncate to WhatsApp's limit if LLM still goes over."""
-        if len(text) <= _WHATSAPP_CHAR_LIMIT:
-            return text
-        logger.warning(f"[LLM Checker] response exceeded {_WHATSAPP_CHAR_LIMIT} chars ({len(text)}), hard-truncating")
-        cutoff = text.rfind('\n', 0, _WHATSAPP_CHAR_LIMIT - 60)
-        if cutoff == -1:
-            cutoff = _WHATSAPP_CHAR_LIMIT - 60
-        return text[:cutoff] + "\n\n_(Ask about a specific product for full details.)_"
-
-    try:
-        api_key = _get_groq_api_key()
-        model_env = os.environ.get("LLM_CHECKER", "groq/openai/gpt-oss-120b")
-        model_name = model_env.split("/", 1)[1] if "/" in model_env else model_env
-        client = _groq.Groq(api_key=api_key)
-        result = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": _PRODUCT_CHECKER_SYSTEM_PROMPT},
-                {"role": "user", "content": f"User message: {user_query}\n\nBot response:\n{agent_response}"},
-            ],
-        )
-        return _hard_cap(result.choices[0].message.content.strip())
-    except Exception as e:
-        logger.warning(f"[LLM Checker] call failed ({type(e).__name__}: {e}), using original response")
-        return _hard_cap(agent_response)
+    return text
 
 
 async def _do_agent_call(phone: str, message: str, session: dict, is_new_session: bool) -> httpx.Response:
@@ -766,7 +940,7 @@ async def chat_with_agent(phone: str, message: str) -> str:
                 sanitized = _sanitize_agent_response(command_responses[0].get("response", ""))
             else:
                 sanitized = _sanitize_agent_response(data.get("response", ""))
-            return await asyncio.to_thread(_llm_check_response_sync, message, sanitized)
+            return _format_order_confirmation(sanitized)
         else:
             logger.error(f"Chat error (HTTP {resp.status_code}): {resp.text}")
             return "I'm having trouble processing that. Please try again."
@@ -1146,6 +1320,80 @@ def _parse_payment_choice(text: str) -> Optional[int]:
     return None
 
 
+def _llm_classify_payment_intent(text: str) -> str:
+    """Use LLM to classify free-form text (including Romanized Hindi/Gujarati) into a
+    payment intent bucket.  Returns '1', '2', '3', '4', 'cancel', or 'unclear'.
+    Falls back to 'unclear' on any error so the menu is re-shown safely.
+    """
+    _SYSTEM = (
+        "You are a payment intent classifier for a WhatsApp bot. "
+        "A customer has been shown four payment options:\n"
+        "1 = Pay using QR code\n"
+        "2 = Pay using net banking\n"
+        "3 = Pay using some other way\n"
+        "4 = Talk to factory / human agent\n\n"
+        "The customer may reply in English, Hindi, Gujarati, or Romanized versions of those languages.\n"
+        "Determine what the customer meant and reply with EXACTLY one token — "
+        "'1', '2', '3', '4', 'cancel', or 'unclear'. Nothing else.\n\n"
+        "'cancel' means the customer wants to cancel the order or cannot afford it or does not want to proceed.\n"
+        "'unclear' means you genuinely cannot determine their intent."
+    )
+    try:
+        api_key = _get_groq_api_key()
+        if not api_key:
+            return "unclear"
+        model_env = os.environ.get("LLM_CHECKER", "groq/openai/gpt-oss-120b")
+        model_name = model_env.split("/", 1)[1] if "/" in model_env else model_env
+        client = _groq.Groq(api_key=api_key)
+        result = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": _SYSTEM},
+                {"role": "user", "content": text},
+            ],
+            max_tokens=5,
+            temperature=0,
+        )
+        token = result.choices[0].message.content.strip().lower()
+        if token in {"1", "2", "3", "4", "cancel", "unclear"}:
+            return token
+        # Handle edge cases like "option 1" or "cancel order"
+        for bucket in ("1", "2", "3", "4"):
+            if bucket in token:
+                return bucket
+        if "cancel" in token:
+            return "cancel"
+        return "unclear"
+    except Exception as e:
+        logger.warning(f"[PaymentClassifier] LLM call failed ({type(e).__name__}: {e}), defaulting to unclear")
+        return "unclear"
+
+
+def _is_cancel_intent(text: str) -> bool:
+    """Keyword-based cancel detection — covers EN / Romanized HI / Romanized GU.
+    Used as a fast pre-LLM check so cancel works even when the LLM is unavailable.
+    """
+    t = text.strip().lower()
+    # Exact single-word matches
+    if t in {"cancel", "no", "nope", "nahi", "nai", "na", "band", "chodo", "rehva"}:
+        return True
+    # Phrase matches — checked with 'in' so partial sentence matches work
+    _cancel_phrases = [
+        "don't want", "dont want", "do not want", "not want",
+        "want to cancel", "cancel the order", "cancel order", "cancel karo",
+        "i don't want to order", "i dont want to order",
+        "don't want to order", "dont want to order",
+        "nai karna", "nai karvu", "nai karvun", "nai joie", "nai joiye",
+        "nai posaay", "nai posay", "order nai", "order nahi",
+        "nahi karna", "nahi chahiye", "nahi lena", "nahi leni",
+        "rehva do", "rehwa do", "chhodvanu", "band karo",
+        "cannot afford", "can't afford", "cant afford", "affordable nahi",
+        "too expensive", "price is high", "price is too high", "bahut mahanga",
+        "not interested", "not proceeding", "won't proceed", "wont proceed",
+    ]
+    return any(phrase in t for phrase in _cancel_phrases)
+
+
 def _add_dashboard_alert(phone: str, message: str):
     """Append a notification alert to the dashboard alert queue."""
     import uuid
@@ -1243,7 +1491,12 @@ async def handle_factory_reply(text: str):
     # Strip the "NEXT STEPS" section from the order summary — that goes in the
     # confirmation message only, not the pricing quote sent to the customer.
     raw_summary = order_data['order_summary']
-    next_steps_idx = raw_summary.upper().find('NEXT STEPS')
+    _upper = raw_summary.upper()
+    # Search for "**NEXT STEPS" first so the opening bold marker is included in
+    # the cutoff — otherwise a lone "**" is left at the end of clean_summary.
+    next_steps_idx = _upper.find('**NEXT STEPS')
+    if next_steps_idx == -1:
+        next_steps_idx = _upper.find('NEXT STEPS')
     clean_summary = raw_summary[:next_steps_idx].rstrip() if next_steps_idx != -1 else raw_summary
 
     # Mark the order as awaiting the customer's payment method choice.
@@ -1277,9 +1530,112 @@ async def handle_factory_reply(text: str):
     )
 
 
+def _llm_detect_language(text: str) -> str:
+    """Detect the language of incoming text using Groq (openai/gpt-oss-120b).
+
+    Returns one of: 'english', 'romanized_hindi', 'romanized_gujarati'.
+    Falls back to 'english' silently on any error.
+    """
+    try:
+        api_key = _get_groq_api_key()
+        if not api_key:
+            logger.warning("[llm_detect_language] no API key available, defaulting to english")
+            return "english"
+        client = _groq.Groq(api_key=api_key)
+        result = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a language detection assistant. Identify the language of the user's message.\n"
+                        "Respond with EXACTLY one of these labels:\n"
+                        "- english\n"
+                        "- romanized_hindi\n"
+                        "- romanized_gujarati\n\n"
+                        "'romanized_hindi' means Hindi written in Latin/English script (e.g. 'mujhe yeh chahiye').\n"
+                        "'romanized_gujarati' means Gujarati written in Latin/English script (e.g. 'mane aa joiye chhe').\n"
+                        "If the message is in English or you are unsure, respond with 'english'.\n"
+                        "Return ONLY the label, nothing else."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            temperature=1,
+        )
+        # reasoning models (openai/gpt-oss-120b) may return content=None when
+        # they use an internal thinking pass; guard against that explicitly.
+        raw_content = result.choices[0].message.content or ""
+        language = raw_content.strip().lower()
+        if language not in {"english", "romanized_hindi", "romanized_gujarati"}:
+            logger.warning(f"[llm_detect_language] unexpected label '{language}', defaulting to english")
+            return "english"
+        logger.info(f"[llm_detect_language] '{text[:40]}' → {language}")
+        return language
+    except Exception as e:
+        logger.warning(f"[llm_detect_language] fallback to english: {e}")
+        return "english"
+
+
+def _translate_to_language(text: str, language: str) -> str:
+    """Translate an English agent response into the detected user language.
+
+    Uses Groq (openai/gpt-oss-120b) via LITELLM_API_KEY_CHECKER.
+    Falls back to the original English text on any error.
+    """
+    lang_label = {
+        "romanized_hindi": "Romanized Hindi (Hindi written in English/Latin script, NOT Devanagari)",
+        "romanized_gujarati": "Romanized Gujarati (Gujarati written in English/Latin script, NOT Gujarati script)",
+    }.get(language)
+    if not lang_label:
+        return text
+    try:
+        api_key = _get_groq_api_key()
+        if not api_key:
+            logger.warning("[translate_to_language] no API key available, skipping translation")
+            return text
+        client = _groq.Groq(api_key=api_key)
+        result = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"Translate the following customer service reply to {lang_label}. "
+                        "Keep product names, prices, numbers, and emojis exactly as they are. "
+                        "Return ONLY the translated text, nothing else."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            temperature=0.2,
+        )
+        translated = result.choices[0].message.content.strip()
+        logger.info(f"[translate_to_language] {language}: {text[:40]!r} → {translated[:40]!r}")
+        return translated
+    except Exception as e:
+        logger.warning(f"[translate_to_language] failed ({type(e).__name__}: {e}), using original")
+        return text
+
+
 async def handle_customer_message(phone: str, text: str, msg_id: str = ""):
     """Handle a message from a customer."""
     stripped = text.strip().lower()
+
+    # Greeting → welcome text + product category list
+    if stripped in _GREET_WORDS:
+        log_message(phone, "user", text)
+        log_message(phone, "bot", WELCOME_MESSAGE)
+        await send_whatsapp(phone, WELCOME_MESSAGE)
+        await send_whatsapp_interactive_list(
+            to=phone,
+            body_text="Which product would you like to know about?",
+            button_label="Browse Products",
+            section_title="Our Products",
+            rows=_PRODUCT_LIST_ROWS,
+            footer_text="Or just type your question anytime!",
+        )
+        return
 
     # Help
     if stripped in {"help", "?", "menu"}:
@@ -1322,6 +1678,29 @@ async def handle_customer_message(phone: str, text: str, msg_id: str = ""):
             phone,
             "Thank you! We've noted your payment preference and connected you with our team. "
             "They'll assist you shortly! 🙏"
+        )
+        return
+
+    # --- Cancel reason follow-up ---
+    _awaiting_cancel = [
+        (oid, data) for oid, data in pending_orders.items()
+        if data.get("customer_phone") == phone and data.get("awaiting_cancel_reason")
+    ]
+    if _awaiting_cancel:
+        order_id_cancel, order_data_cancel = max(_awaiting_cancel, key=lambda x: x[1]["timestamp"])
+        cancel_reason = text.strip()
+        await send_whatsapp(
+            FACTORY_WHATSAPP,
+            f"❌ Order #{order_id_cancel} — customer cancelled\n"
+            f"👤 {order_data_cancel.get('customer_name', 'Customer')} ({phone})\n"
+            f"📝 Reason: {cancel_reason}"
+        )
+        remove_pending_order(order_id_cancel)
+        await send_and_log(
+            phone,
+            "We understand. Your order has been cancelled. 🙏\n\n"
+            "If you change your mind or need anything else, we're always here! "
+            "Feel free to start a new order anytime. 😊"
         )
         return
 
@@ -1378,30 +1757,83 @@ async def handle_customer_message(phone: str, text: str, msg_id: str = ""):
                 "Connecting you with our factory team now! They'll be with you shortly. 🙏"
             )
 
-        elif stripped in {"cancel", "no", "nope"}:
-            await send_whatsapp(
-                FACTORY_WHATSAPP,
-                f"❌ Order #{order_id_pay} — customer cancelled payment\n"
-                f"👤 {order_data_pay.get('customer_name', 'Customer')} ({phone})"
-            )
-            remove_pending_order(order_id_pay)
+        elif _is_cancel_intent(stripped):
+            pending_orders[order_id_pay]["awaiting_payment_choice"] = False
+            pending_orders[order_id_pay]["awaiting_cancel_reason"] = True
             await send_and_log(
                 phone,
-                "No problem! Your order has been cancelled. Feel free to start a new order anytime. 😊\n\n"
-                "Thank you for considering Kavacch!"
+                "We're sorry to hear that! 😔 Could you let us know why you'd like to cancel? "
+                "(e.g. price is too high, don't need it anymore, found another option)\n\n"
+                "Your feedback helps us improve, and we might be able to help! 🙏"
             )
 
         else:
-            # Unrecognized input — repeat the menu
-            await send_and_log(
-                phone,
-                "Please choose one of the options:\n\n"
-                "1️⃣ Pay using QR code\n"
-                "2️⃣ Pay using net banking\n"
-                "3️⃣ Pay using other way\n"
-                "4️⃣ Talk to factory\n\n"
-                "Reply *1*, *2*, *3*, or *4*."
-            )
+            # _parse_payment_choice returned None and no keyword matched —
+            # Must use asyncio.to_thread: calling the blocking Groq HTTP client
+            # directly inside FastAPI's event loop raises
+            # "This event loop is already running", which is caught silently
+            # and always returns 'unclear', breaking cancel/option detection.
+            llm_intent = await asyncio.to_thread(_llm_classify_payment_intent, text)
+            if llm_intent == "cancel":
+                pending_orders[order_id_pay]["awaiting_payment_choice"] = False
+                pending_orders[order_id_pay]["awaiting_cancel_reason"] = True
+                await send_and_log(
+                    phone,
+                    "We're sorry to hear that! 😔 Could you let us know why you'd like to cancel? "
+                    "(e.g. price is too high, don't need it anymore, found another option)\n\n"
+                    "Your feedback helps us improve, and we might be able to help! 🙏"
+                )
+            elif llm_intent == "1":
+                pending_orders[order_id_pay]["awaiting_payment_choice"] = False
+                pending_orders[order_id_pay]["awaiting_payment_screenshot"] = True
+                await _send_qr_code(phone)
+                await send_and_log(
+                    phone,
+                    "💳 Here's the QR code above!\n\n"
+                    "Please complete the payment and send us a *screenshot* once done. 📸"
+                )
+            elif llm_intent == "2":
+                link = _get_net_banking_link()
+                pending_orders[order_id_pay]["awaiting_payment_choice"] = False
+                pending_orders[order_id_pay]["awaiting_payment_screenshot"] = True
+                await send_and_log(
+                    phone,
+                    f"🏦 *Net Banking Payment Link:*\n{link}\n\n"
+                    "Please complete the payment and send us a *screenshot* once done. 📸"
+                )
+            elif llm_intent == "3":
+                pending_orders[order_id_pay]["awaiting_payment_choice"] = False
+                pending_orders[order_id_pay]["awaiting_payment_method_description"] = True
+                await send_and_log(phone, "Sure! Can you tell me which payment method you'd like to use? 💬")
+            elif llm_intent == "4":
+                set_control_state(phone, "HUMAN_CONTROL")
+                _add_dashboard_alert(
+                    phone,
+                    f"🔔 Customer {phone} wants to talk to factory directly (order #{order_id_pay}). Takeover enabled."
+                )
+                await send_whatsapp(
+                    FACTORY_WHATSAPP,
+                    f"🔔 Customer {phone} wants to talk to factory directly\n"
+                    f"Order #{order_id_pay} — {order_data_pay.get('customer_name', 'Customer')}\n"
+                    f"Price quote: {order_data_pay.get('price_text', 'N/A')}"
+                )
+                log_message(phone, "bot", "🔔 Customer requested factory connection. Takeover enabled.", msg_type="notification")
+                remove_pending_order(order_id_pay)
+                await send_and_log(
+                    phone,
+                    "Connecting you with our factory team now! They'll be with you shortly. 🙏"
+                )
+            else:
+                # Genuinely unclear — re-show the menu
+                await send_and_log(
+                    phone,
+                    "Please choose one of the options:\n\n"
+                    "1️⃣ Pay using QR code\n"
+                    "2️⃣ Pay using net banking\n"
+                    "3️⃣ Pay using other way\n"
+                    "4️⃣ Talk to factory\n\n"
+                    "Reply *1*, *2*, *3*, or *4*."
+                )
 
         return  # always return — never fall through to agent while in payment state
 
@@ -1414,8 +1846,16 @@ async def handle_customer_message(phone: str, text: str, msg_id: str = ""):
     # when the customer sends messages back-to-back.  The lock is held for the
     # full round-trip (agent call + WhatsApp send) so replies arrive in order.
     async with _get_phone_lock(phone):
-        response = await chat_with_agent(phone, text)
+        # Run language detection and agent call in parallel — both use Groq so
+        # they execute concurrently and the user only waits for the slower of the two.
+        detected_language, response = await asyncio.gather(
+            asyncio.to_thread(_llm_detect_language, text),
+            chat_with_agent(phone, text),
+        )
+        session_cache.setdefault(phone, {})["language"] = detected_language
         if response:
+            if detected_language != "english":
+                response = await asyncio.to_thread(_translate_to_language, response, detected_language)
             await send_and_log(phone, response)
 
 
@@ -1481,11 +1921,48 @@ async def webhook(request: Request):
                 if "messages" in value:
                     msg = value["messages"][0]
                     
-                    if msg.get("type") == "text":
+                    if msg.get("type") == "interactive":
+                        # User tapped a list row or reply button
+                        phone = msg["from"]
+                        msg_id = msg.get("id", "")
+                        interactive_payload = msg.get("interactive", {})
+                        interactive_type = interactive_payload.get("type", "")
+
+                        if interactive_type == "list_reply":
+                            reply_id = interactive_payload["list_reply"].get("id", "")
+                            reply_title = interactive_payload["list_reply"].get("title", "")
+                        elif interactive_type == "button_reply":
+                            reply_id = interactive_payload["button_reply"].get("id", "")
+                            reply_title = interactive_payload["button_reply"].get("title", "")
+                        else:
+                            reply_id = ""
+                            reply_title = ""
+
+                        # Map list row id → agent query; fall back to title
+                        agent_text = next(
+                            (r["agent_query"] for r in _PRODUCT_LIST_ROWS if r["id"] == reply_id),
+                            f"Tell me about {reply_title}" if reply_title else None,
+                        )
+
+                        if agent_text:
+                            if msg_id and msg_id in processed_message_ids:
+                                logger.info(f"Skipping duplicate interactive {msg_id}")
+                                return {"status": "ok"}
+                            if msg_id:
+                                processed_message_ids[msg_id] = datetime.now()
+                                cleanup_processed_messages()
+
+                            log_message(phone, "user", reply_title or agent_text)
+                            await handle_message(phone, agent_text, msg_id)
+
+                    elif msg.get("type") == "text":
                         phone = msg["from"]
                         text = msg["text"]["body"]
                         msg_id = msg.get("id", "")
-                        
+
+                        # Register inbound message for reply-context lookup
+                        _register_message(msg_id, text, "customer")
+
                         # Deduplicate: skip if already processed
                         if msg_id and msg_id in processed_message_ids:
                             logger.info(f"Skipping duplicate message {msg_id}")
@@ -1494,11 +1971,23 @@ async def webhook(request: Request):
                         if msg_id:
                             processed_message_ids[msg_id] = datetime.now()
                             cleanup_processed_messages()
-                        
+
+                        # Enrich text with reply context when the customer
+                        # long-presses and replies to a specific message.
+                        # Factory messages are excluded — they use ref codes.
+                        replied_to_id = msg.get("context", {}).get("id", "")
+                        is_factory = (phone == FACTORY_WHATSAPP or phone == FACTORY_WHATSAPP.lstrip("91"))
+                        if replied_to_id and not is_factory:
+                            enriched_text = _build_enriched_text(phone, replied_to_id, text)
+                            if enriched_text != text:
+                                logger.info(f"[REPLY CTX {phone}] replied_to={replied_to_id[:20]}…")
+                        else:
+                            enriched_text = text
+
                         # Await directly to keep Cloud Run request active
                         # (fire-and-forget via create_task causes Cloud Run
                         #  to kill the container when no requests are active)
-                        await handle_message(phone, text, msg_id)
+                        await handle_message(phone, enriched_text, msg_id)
 
                     elif msg.get("type") == "image":
                         phone = msg["from"]

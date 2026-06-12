@@ -1,6 +1,6 @@
 """Support session for managing customer interactions"""
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 class OrderItem:
@@ -26,6 +26,7 @@ class SupportSession:
         self.customer_phone = customer_phone
         self.customer_name = customer_name
         self.cart: List[OrderItem] = []
+        self.last_product_category: Optional[str] = None
 
     def add_to_cart(self, product_type: str, product_name: str, quantity: int, notes: str = "") -> bool:
         """Add an item to the cart"""
@@ -49,14 +50,21 @@ class SupportSession:
         if not self.cart:
             return "Your cart is empty. Feel free to ask about our products!"
 
-        cart_summary = "**Your Cart:**\n\n"
+        lines = ["🛒 **Your Current Order:**\n"]
+        divider = "─" * 21
         for i, item in enumerate(self.cart, 1):
-            cart_summary += f"{i}. {item}\n"
+            lines.append(divider)
+            lines.append(f"📦 **{i}. {item.product_type} — {item.product_name}**")
+            lines.append(f"   • Qty: **{item.quantity}**")
+            if item.notes:
+                lines.append(f"   • 📝 {item.notes}")
+        lines.append(divider)
 
-        cart_summary += f"\n**Total Items:** {len(self.cart)}\n"
-        cart_summary += f"**Total Quantity:** {sum(item.quantity for item in self.cart)}"
+        total_items = len(self.cart)
+        total_qty = sum(item.quantity for item in self.cart)
+        lines.append(f"\n**{total_items} item{'s' if total_items != 1 else ''}**  |  **Total qty: {total_qty}**")
 
-        return cart_summary
+        return "\n".join(lines)
 
     def clear_cart(self):
         """Clear all items from cart"""
